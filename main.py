@@ -5,14 +5,14 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 
    # Включаем простые логи, чтобы видеть, что бот работает
-   logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO)
 
    # Берем токен из настроек сервера (мы добавим его на следующем шаге)
-   BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
    # Создаем объекты бота и диспетчера
-   bot = Bot(token=BOT_TOKEN)
-   dp = Dispatcher()
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
    # Команда /start
    @dp.message(CommandStart())
