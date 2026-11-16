@@ -1,8 +1,8 @@
-   import os
-   import logging
-   import asyncio
-   from aiogram import Bot, Dispatcher, types
-   from aiogram.filters import CommandStart
+import os
+import logging
+import asyncio
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import CommandStart
 
    # Включаем простые логи, чтобы видеть, что бот работает
    logging.basicConfig(level=logging.INFO)
