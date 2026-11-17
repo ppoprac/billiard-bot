@@ -11,9 +11,11 @@ from database import (
     init_db,
     get_or_create_user,
     get_user_profile,
-    get_top_players,
     get_all_users,
     get_players_above,
+    get_total_players,
+    get_user_rank,
+    get_players_upto,
     record_match,
     create_challenge,
     get_challenge,
@@ -41,9 +43,10 @@ dp = Dispatcher()
 
 
 def display_name(row):
-    """Универсальное имя: full_name → username → 'Аноним'"""
     return row[2] or row[1] or "Аноним"
 
+
+# ================== БАЗОВЫЕ КОМАНДЫ ==================
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -86,42 +89,13 @@ async def cmd_profile(message: types.Message):
     )
 
 
-@dp.message(Command("top"))
-async def cmd_top(message: types.Message):
-    user = await get_user_profile(message.from_user.id)
-    if not user:
-        await message.answer("Сначала напиши /start")
-        return
-
-    players = await get_top_players(10)
-    if not players:
-        await message.answer("Пока нет игроков в рейтинге")
-        return
-
-    challengeable = await get_players_above(message.from_user.id)
-    challengeable_ids = {row[1] for row in challengeable}
-
-    text = "🏆 <b>Топ-10 игроков</b>\n\n"
-    for i, p in enumerate(players, 1):
-        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        marker = ""
-        if p[0] == message.from_user.id:
-            marker = " 👈 ты"
-        elif p[0] in challengeable_ids:
-            marker = " ⬆️"
-        text += f"{medal} {display_name(p)} — <b>{p[3]}</b> ELO{marker}\n"
-
-    text += "\n⬆️ — можешь вызвать через /challenge"
-    await message.answer(text, parse_mode="HTML")
-
-
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
     await message.answer(
         "📖 <b>Команды</b>\n\n"
         "/start — Начать работу\n"
         "/profile — Твой профиль\n"
-        "/top — Топ-10 игроков\n"
+        "/top — Таблица рейтинга\n"
         "/match — Записать поражение (ты проиграл)\n"
         "/result — Записать победу (ты выиграл)\n"
         "/challenge — Вызвать игрока выше тебя (до 10 позиций)\n"
@@ -130,7 +104,72 @@ async def cmd_help(message: types.Message):
     )
 
 
-# === /match — проигравший инициирует ===
+# ================== /top ==================
+
+@dp.message(Command("top"))
+async def cmd_top(message: types.Message):
+    user = await get_user_profile(message.from_user.id)
+    if not user:
+        await message.answer("Сначала напиши /start")
+        return
+
+    total = await get_total_players()
+    if total == 0:
+        await message.answer("Пока нет игроков в рейтинге")
+        return
+
+    user_id = message.from_user.id
+    user_rank = await get_user_rank(user_id)
+    if user_rank is None:
+        await message.answer("Не могу определить твою позицию, попробуй позже")
+        return
+
+    if total <= 30 or user_rank <= 30:
+        # Всё помещается (или пользователь в топ-30 — показываем первые 30)
+        show_upto = min(30, total)
+        players = await get_players_upto(show_upto)
+        display_ranks = list(range(1, len(players) + 1))
+    else:
+        # Пользователь ниже 30-го — окно вокруг него
+        show_upto = min(user_rank + 5, total)
+        players = await get_players_upto(show_upto)
+
+        top_ranks = list(range(1, 11))
+        above_from = max(11, user_rank - 10)
+        above_to = user_rank - 1
+        above_ranks = list(range(above_from, above_to + 1)) if above_from <= above_to else []
+        me_rank = [user_rank]
+        below_ranks = list(range(user_rank + 1, min(user_rank + 5, total) + 1))
+
+        display_ranks = top_ranks + above_ranks + me_rank + below_ranks
+
+    text = "🏆 <b>Рейтинг игроков</b>\n\n"
+    prev_rank = 0
+    for rank in display_ranks:
+        if rank > prev_rank + 1:
+            text += "   ⋮\n"
+        prev_rank = rank
+
+        if rank > len(players):
+            continue
+        _, tid, uname, fname, elo = players[rank - 1]
+
+        medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"{rank}."
+        name = fname or uname or "Аноним"
+
+        marker = ""
+        if tid == user_id:
+            marker = " 👈 ты"
+        elif rank < user_rank and user_rank - rank <= 10:
+            marker = " ⬆️"
+
+        text += f"{medal} {name} — <b>{elo}</b> ELO{marker}\n"
+
+    text += f"\n<i>Всего игроков: {total}</i>\n⬆️ — можешь вызвать через /challenge"
+    await message.answer(text, parse_mode="HTML")
+
+
+# ================== /match (проигравший инициирует) ==================
 
 @dp.message(Command("match"))
 async def cmd_match(message: types.Message):
@@ -165,7 +204,6 @@ async def process_select_opponent(callback: CallbackQuery):
     if not loser or not winner:
         await callback.answer("Игрок не найден", show_alert=True)
         return
-
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="✅ Да, я проиграл",
@@ -184,7 +222,6 @@ async def process_select_opponent(callback: CallbackQuery):
 async def process_confirm_lose(callback: CallbackQuery):
     winner_id = int(callback.data.removeprefix("confirm_lose_"))
     loser_id = callback.from_user.id
-
     success, data = await record_match(winner_id, loser_id)
     if success:
         new_winner_elo, new_loser_elo = data
@@ -208,20 +245,18 @@ async def process_confirm_lose(callback: CallbackQuery):
     await callback.answer()
 
 
-# === /result — победитель инициирует ===
+# ================== /result (победитель инициирует) ==================
 
 @dp.message(Command("result"))
 async def cmd_result(message: types.Message):
     if not await get_user_profile(message.from_user.id):
         await message.answer("Сначала напиши /start")
         return
-
     players = await get_all_users(30)
     players = [p for p in players if p[0] != message.from_user.id]
     if not players:
         await message.answer("Пока нет других игроков")
         return
-
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text=f"🏆 {display_name(p)} ({p[3]} ELO)",
@@ -244,14 +279,12 @@ async def process_result_select(callback: CallbackQuery):
     if not winner or not loser:
         await callback.answer("Игрок не найден", show_alert=True)
         return
-
     success, data = await create_pending_result(winner_id, loser_id)
     if not success:
         await callback.message.edit_text(f"❌ {data}")
         await callback.answer()
         return
     pending_id = data
-
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="✅ Подтвердить поражение",
@@ -277,7 +310,6 @@ async def process_result_select(callback: CallbackQuery):
         await delete_pending_result(pending_id)
         await callback.answer()
         return
-
     await callback.message.edit_text(
         f"✅ Запрос отправлен игроку {display_name(loser)}. Ждём подтверждения."
     )
@@ -292,12 +324,10 @@ async def process_result_confirm(callback: CallbackQuery):
         await callback.message.edit_text("❌ Запрос устарел или уже обработан.")
         await callback.answer()
         return
-
     _, winner_id, loser_id = pending
     if callback.from_user.id != loser_id:
         await callback.answer("Это не твой запрос", show_alert=True)
         return
-
     await delete_pending_result(pending_id)
     success, data = await record_match(winner_id, loser_id)
     if success:
@@ -329,32 +359,28 @@ async def process_result_decline(callback: CallbackQuery):
         await callback.message.edit_text("❌ Запрос устарел.")
         await callback.answer()
         return
-
     _, winner_id, loser_id = pending
     if callback.from_user.id != loser_id:
         await callback.answer("Это не твой запрос", show_alert=True)
         return
-
     await delete_pending_result(pending_id)
     await callback.message.edit_text("❌ Ты отклонил запрос. Результат не записан.")
     try:
         await bot.send_message(
-            winner_id,
-            "❌ Соперник отклонил запрос на победу.",
+            winner_id, "❌ Соперник отклонил запрос на победу."
         )
     except Exception:
         pass
     await callback.answer()
 
 
-# === /challenge — вызов игрока выше ===
+# ================== /challenge ==================
 
 @dp.message(Command("challenge"))
 async def cmd_challenge(message: types.Message):
     if not await get_user_profile(message.from_user.id):
         await message.answer("Сначала напиши /start")
         return
-
     available = await get_players_above(message.from_user.id)
     if not available:
         await message.answer(
@@ -362,7 +388,6 @@ async def cmd_challenge(message: types.Message):
             "Смотри /top"
         )
         return
-
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text=f"#{rank} {fname or uname or 'Аноним'} ({elo} ELO)",
@@ -386,14 +411,12 @@ async def process_challenge_select(callback: CallbackQuery):
     if not challenger or not opponent:
         await callback.answer("Игрок не найден", show_alert=True)
         return
-
     success, data = await create_challenge(challenger_id, opponent_id)
     if not success:
         await callback.message.edit_text(f"❌ {data}")
         await callback.answer()
         return
     challenge_id = data
-
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="✅ Принять",
@@ -419,7 +442,6 @@ async def process_challenge_select(callback: CallbackQuery):
         await update_challenge_status(challenge_id, "failed")
         await callback.answer()
         return
-
     await callback.message.edit_text(
         f"✅ Вызов отправлен игроку {display_name(opponent)}. Ждём ответа."
     )
@@ -434,12 +456,10 @@ async def process_challenge_accept(callback: CallbackQuery):
         await callback.message.edit_text("❌ Вызов устарел или уже обработан.")
         await callback.answer()
         return
-
     _, challenger_id, opponent_id, _ = challenge
     if callback.from_user.id != opponent_id:
         await callback.answer("Это не твой вызов", show_alert=True)
         return
-
     await update_challenge_status(challenge_id, "accepted")
     await callback.message.edit_text(
         "✅ <b>Вызов принят!</b>\n\n"
@@ -468,12 +488,10 @@ async def process_challenge_decline(callback: CallbackQuery):
         await callback.message.edit_text("❌ Вызов устарел или уже обработан.")
         await callback.answer()
         return
-
     _, challenger_id, opponent_id, _ = challenge
     if callback.from_user.id != opponent_id:
         await callback.answer("Это не твой вызов", show_alert=True)
         return
-
     await update_challenge_status(challenge_id, "declined")
     await callback.message.edit_text("❌ Ты отклонил вызов.")
     try:
@@ -487,7 +505,7 @@ async def process_challenge_decline(callback: CallbackQuery):
     await callback.answer()
 
 
-# === Webhook ===
+# ================== Webhook ==================
 
 async def on_startup(bot: Bot):
     await init_db()
