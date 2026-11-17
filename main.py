@@ -89,7 +89,7 @@ async def main():
     await init_db()
     print("База данных инициализирована")
     print("Бот запущен и ожидает сообщения...")
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
