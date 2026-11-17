@@ -4,7 +4,7 @@ import asyncio
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart, Command
-from database import init_db, get_or_create_user, get_user_profile, get_top_players, get_user_by_username, record_match
+from database import init_db, get_or_create_user, get_user_profile, get_top_players, get_user_by_username, record_match, get_all_users
 
 logging.basicConfig(level=logging.INFO)
 
@@ -87,68 +87,79 @@ async def cmd_help(message: types.Message):
 
 @dp.message(Command("match"))
 async def cmd_match(message: types.Message):
-    args = message.text.split()
-    
-    if len(args) < 2:
-        await message.answer("⚠️ Напиши ник соперника. Пример: `/match @ivan`", parse_mode="Markdown")
+    # Проверяем, зарегистрирован ли пользователь
+    user = await get_user_profile(message.from_user.id)
+    if not user:
+        await message.answer("Сначала напиши /start, чтобы зарегистрироваться")
         return
 
-    opponent_username = args[1]
-    opponent = await get_user_by_username(opponent_username)
-    
-    if not opponent:
-        await message.answer(f"❌ Игрок {opponent_username} не найден. Пусть он сначала напишет боту /start")
+    # Получаем список игроков (топ-30)
+    players = await get_all_users(30)
+    # Убираем из списка самого пользователя
+    players = [p for p in players if p[0] != message.from_user.id]
+
+    if not players:
+        await message.answer("Пока не с кем играть. Попроси друга написать боту /start")
         return
 
-    if opponent[0] == message.from_user.id:
-        await message.answer("❌ Нельзя играть сам с собой! 😄")
-        return
-
-    # Создаем красивые кнопки
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Я выиграл", callback_data=f"match_win_{opponent[0]}"),
-            InlineKeyboardButton(text="❌ Я проиграл", callback_data=f"match_lose_{opponent[0]}")
-        ]
-    ])
+    # Создаем кнопки с именами игроков
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    for p in players:
+        # Берем имя, если нет - берем никнейм
+        name = p[2] if p[2] else (p[1] if p[1] else "Аноним")
+        # Кнопка на всю ширину экрана
+        btn = InlineKeyboardButton(text=f"🎱 {name} ({p[3]} ELO)", callback_data=f"select_opp_{p[0]}")
+        keyboard.inline_keyboard.append([btn])
 
     await message.answer(
-        f"🎱 **Матч против:** {opponent[2]}\n"
-        f"📊 Его рейтинг: **{opponent[3]}** ELO\n\n"
-        f"Как прошел матч?",
-        reply_markup=keyboard
+        "🎱 **Выбери соперника, которому ты проиграл:**", 
+        reply_markup=keyboard,
+        parse_mode="Markdown"
     )
 
-# Обработчик нажатий на кнопки
-@dp.callback_query(F.data.startswith("match_"))
-async def process_match_result(callback: CallbackQuery):
-    # Разбираем данные кнопки (например, match_win_123456789)
-    parts = callback.data.split("_")
-    result = parts[1]  # win или lose
-    opponent_id = int(parts[2])
-    
-    winner_id = callback.from_user.id if result == "win" else opponent_id
-    loser_id = opponent_id if result == "win" else callback.from_user.id
+# Обработчик выбора соперника
+@dp.callback_query(F.data.startswith("select_opp_"))
+async def process_select_opponent(callback: CallbackQuery):
+    opponent_id = int(callback.data.split("_")[2])
+    loser_id = callback.from_user.id
+
+    # Получаем данные для красивого отображения
+    loser = await get_user_profile(loser_id)
+    winner = await get_user_profile(opponent_id)
+
+    loser_name = loser[2] if loser[2] else "Ты"
+    winner_name = winner[2] if winner[2] else "Соперник"
+
+    # Кнопка подтверждения
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, я проиграл", callback_data=f"confirm_lose_{opponent_id}")]
+    ])
+
+    text = f"Ты ({loser_name}) проиграл {winner_name}?\nНажми кнопку для подтверждения."
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+# Обработчик подтверждения поражения
+@dp.callback_query(F.data.startswith("confirm_lose_"))
+async def process_confirm_lose(callback: CallbackQuery):
+    winner_id = int(callback.data.split("_")[2])
+    loser_id = callback.from_user.id
 
     success, data = await record_match(winner_id, loser_id)
-    
+
     if success:
         new_winner_elo = data[0]
         new_loser_elo = data[1]
         
-        winner_name = callback.from_user.full_name if result == "win" else "Соперник"
-        loser_name = "Соперник" if result == "win" else callback.from_user.full_name
-        
-        text = (f"✅ **Результат записан!**\n\n"
-                f"🏆 Победитель: {winner_name} (теперь **{new_winner_elo}** ELO)\n"
-                f"📉 Проигравший: {loser_name} (теперь **{new_loser_elo}** ELO)")
-        
-        # Заменяем сообщение с кнопками на текст результата
+        text = (f"✅ **Результат честно записан!**\n\n"
+                f"📉 Твой новый рейтинг: **{new_loser_elo}** ELO\n"
+                f"🏆 Рейтинг соперника: **{new_winner_elo}** ELO\n\n"
+                f"Посмотри обновленный топ командой /top")
         await callback.message.edit_text(text)
     else:
-        await callback.answer("❌ Ошибка при записи матча", show_alert=True)
+        await callback.message.edit_text("❌ Ошибка при записи матча.")
         
-    await callback.answer() # Убираем "часики" на кнопке
+    await callback.answer()
 
 async def main():
     # Инициализируем базу данных
