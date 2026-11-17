@@ -1,10 +1,11 @@
-import logging
-import asyncio
 import os
+import logging
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart, Command
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 from database import (
     init_db,
@@ -17,7 +18,16 @@ from database import (
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # см. примечание ниже
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL")
+PORT = int(os.getenv("PORT", 8080))
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
+
+if not BOT_TOKEN:
+    raise RuntimeError("Переменная BOT_TOKEN не установлена")
+if not BASE_URL:
+    raise RuntimeError("Переменная RENDER_EXTERNAL_URL не установлена")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -185,12 +195,29 @@ async def process_confirm_lose(callback: CallbackQuery):
     await callback.answer()
 
 
-async def main():
+async def on_startup(bot: Bot):
     await init_db()
-    print("База данных инициализирована")
-    print("Бот запущен и ожидает сообщения...")
-    await dp.start_polling(bot, skip_updates=True)
+    logging.info("База данных инициализирована")
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    logging.info(f"Webhook установлен: {WEBHOOK_URL}")
+
+
+async def healthcheck(request: web.Request):
+    return web.Response(text="OK")
+
+
+def main():
+    dp.startup.register(on_startup)
+
+    app = web.Application()
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+    app.router.add_get("/", healthcheck)
+    app.router.add_get("/healthcheck", healthcheck)
+    setup_application(app, dp, bot=bot)
+
+    logging.info(f"Запуск web-сервера на 0.0.0.0:{PORT}")
+    web.run_app(app, host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
