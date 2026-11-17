@@ -55,7 +55,6 @@ async def get_or_create_user(telegram_id: int, username: str, full_name: str):
             (telegram_id,)
         )
         user = await cursor.fetchone()
-
         if not user:
             await db.execute(
                 'INSERT INTO users (telegram_id, username, full_name) VALUES (?, ?, ?)',
@@ -67,7 +66,6 @@ async def get_or_create_user(telegram_id: int, username: str, full_name: str):
                 (telegram_id,)
             )
             user = await cursor.fetchone()
-
         return user
 
 
@@ -92,7 +90,6 @@ async def get_top_players(limit: int = 10):
 def calculate_elo(winner_elo: int, loser_elo: int, k_factor: int = 32):
     expected_winner = 1 / (1 + math.pow(10, (loser_elo - winner_elo) / 400))
     expected_loser = 1 / (1 + math.pow(10, (winner_elo - loser_elo) / 400))
-
     new_winner_elo = round(winner_elo + k_factor * (1 - expected_winner))
     new_loser_elo = round(loser_elo + k_factor * (0 - expected_loser))
     return new_winner_elo, new_loser_elo
@@ -106,15 +103,7 @@ async def get_user_by_username(username: str):
 
 
 async def record_match(winner_id: int, loser_id: int):
-    """
-    Записывает результат матча и обновляет ELO обоих игроков.
-    Защита от дублирования: нельзя записать матч между теми же игроками
-    чаще раза в MATCH_COOLDOWN_MINUTES минут.
-
-    Возвращает: (success: bool, data)
-    - при успехе: data = (new_winner_elo, new_loser_elo)
-    - при ошибке: data = строка с описанием ошибки
-    """
+    """Возвращает (success, data). data = (new_w_elo, new_l_elo) или строка ошибки."""
     if winner_id == loser_id:
         return False, "Нельзя записать матч с самим собой"
 
@@ -136,12 +125,10 @@ async def record_match(winner_id: int, loser_id: int):
             'SELECT elo_rating FROM users WHERE telegram_id = ?', (loser_id,)
         )
         loser_data = await cursor.fetchone()
-
         if not winner_data or not loser_data:
             return False, "Один из игроков не найден в базе"
 
         new_winner_elo, new_loser_elo = calculate_elo(winner_data[0], loser_data[0])
-
         await db.execute(
             'UPDATE users SET elo_rating = ?, games_played = games_played + 1, wins = wins + 1 '
             'WHERE telegram_id = ?',
@@ -157,7 +144,6 @@ async def record_match(winner_id: int, loser_id: int):
             (winner_id, loser_id)
         )
         await db.commit()
-
         return True, (new_winner_elo, new_loser_elo)
 
 
@@ -172,27 +158,21 @@ async def get_all_users(limit: int = 30):
 
 
 async def get_players_above(telegram_id: int, max_above: int = CHALLENGE_RANGE):
-    """
-    Возвращает список игроков выше telegram_id по рейтингу (не более max_above позиций).
-    Формат: [(rank, telegram_id, username, full_name, elo), ...]
-    Отсортировано от ближайшего к вызывающему к самому высокому.
-    """
+    """Список игроков выше telegram_id по рейтингу (не более max_above позиций).
+    Формат: [(rank, tid, uname, fname, elo), ...] — от ближайшего к самому высокому."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             'SELECT telegram_id, username, full_name, elo_rating FROM users '
             'ORDER BY elo_rating DESC, telegram_id ASC'
         )
         rows = await cursor.fetchall()
-
         user_index = None
         for i, row in enumerate(rows):
             if row[0] == telegram_id:
                 user_index = i
                 break
-
         if user_index is None or user_index == 0:
             return []
-
         start = max(0, user_index - max_above)
         result = []
         for i in range(user_index - 1, start - 1, -1):
@@ -202,17 +182,57 @@ async def get_players_above(telegram_id: int, max_above: int = CHALLENGE_RANGE):
         return result
 
 
+# === Функции для нового /top ===
+
+async def get_total_players() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute('SELECT COUNT(*) FROM users')
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+
+async def get_user_rank(telegram_id: int):
+    """Позиция пользователя в рейтинге (1 = первый). None если не найден."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            'SELECT elo_rating FROM users WHERE telegram_id = ?', (telegram_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        user_elo = row[0]
+        cursor = await db.execute(
+            '''SELECT COUNT(*) FROM users 
+               WHERE elo_rating > ? 
+               OR (elo_rating = ? AND telegram_id < ?)''',
+            (user_elo, user_elo, telegram_id)
+        )
+        count_row = await cursor.fetchone()
+        return count_row[0] + 1
+
+
+async def get_players_upto(max_rank: int):
+    """Список (rank, tid, uname, fname, elo) от 1-го до max_rank."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            'SELECT telegram_id, username, full_name, elo_rating FROM users '
+            'ORDER BY elo_rating DESC, telegram_id ASC LIMIT ?',
+            (max_rank,)
+        )
+        rows = await cursor.fetchall()
+        return [(i + 1, row[0], row[1], row[2], row[3]) for i, row in enumerate(rows)]
+
+
+# === Challenges ===
+
 async def create_challenge(challenger_id: int, opponent_id: int):
-    """Возвращает (success, challenge_id или текст ошибки)"""
     if challenger_id == opponent_id:
         return False, "Нельзя вызвать самого себя"
-
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "DELETE FROM challenges WHERE status = 'pending' "
             "AND created_at < datetime('now', '-24 hours')"
         )
-
         cursor = await db.execute(
             "SELECT id FROM challenges WHERE challenger_id = ? AND opponent_id = ? "
             "AND status = 'pending'",
@@ -221,7 +241,6 @@ async def create_challenge(challenger_id: int, opponent_id: int):
         if await cursor.fetchone():
             await db.commit()
             return False, "Ты уже отправил вызов этому игроку, жди ответа"
-
         await db.execute(
             'INSERT INTO challenges (challenger_id, opponent_id) VALUES (?, ?)',
             (challenger_id, opponent_id)
@@ -250,16 +269,15 @@ async def update_challenge_status(challenge_id: int, status: str):
         await db.commit()
 
 
+# === Pending results ===
+
 async def create_pending_result(winner_id: int, loser_id: int):
-    """Возвращает (success, pending_id или текст ошибки)"""
     if winner_id == loser_id:
         return False, "Нельзя выбрать самого себя"
-
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "DELETE FROM pending_results WHERE created_at < datetime('now', '-24 hours')"
         )
-
         cursor = await db.execute(
             'SELECT id FROM pending_results WHERE winner_id = ? AND loser_id = ?',
             (winner_id, loser_id)
@@ -267,7 +285,6 @@ async def create_pending_result(winner_id: int, loser_id: int):
         if await cursor.fetchone():
             await db.commit()
             return False, "Результат уже ожидает подтверждения от этого игрока"
-
         await db.execute(
             'INSERT INTO pending_results (winner_id, loser_id) VALUES (?, ?)',
             (winner_id, loser_id)
