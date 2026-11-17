@@ -32,7 +32,10 @@ async def cmd_start(message: types.Message):
         f"🏆 Лестница вызовов\n"
         f"📊 Турнирные сетки\n"
         f"📍 Поиск соперников\n\n"
-        f"Используй /help для списка команд"
+        f"👇 Быстрые команды:\n"
+   f"/match — Записать поражение\n"
+   f"/top — Таблица рейтинга\n"
+   f"/profile — Твоя статистика"
     )
 
 @dp.message(Command("profile"))
