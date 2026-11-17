@@ -3,7 +3,7 @@ import logging
 import asyncio
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
-from database import init_db, get_or_create_user, get_user_profile, get_top_players
+from database import init_db, get_or_create_user, get_user_profile, get_top_players, get_user_by_username, record_match
 
 logging.basicConfig(level=logging.INFO)
 
@@ -83,6 +83,54 @@ async def cmd_help(message: types.Message):
         "/result — Ввести результат матча\n"
         "/ladder — Таблица лестницы"
     )
+
+@dp.message(Command("match"))
+async def cmd_match(message: types.Message):
+    # Ожидаем формат: /match @никнейм win (или lose)
+    args = message.text.split()
+    
+    if len(args) < 3:
+        await message.answer("⚠️ Неверный формат.\nИспользуй: `/match @никнейм win`\n(где win означает, что ТЫ выиграл)", parse_mode="Markdown")
+        return
+
+    opponent_username = args[1]
+    result = args[2].lower()
+
+    if result not in ["win", "lose"]:
+        await message.answer("⚠️ Результат должен быть `win` (ты выиграл) или `lose` (ты проиграл)")
+        return
+
+    # Ищем соперника в базе
+    opponent = await get_user_by_username(opponent_username)
+    if not opponent:
+        await message.answer(f"❌ Игрок с ником {opponent_username} не найден в базе. Возможно, он ещё не писал боту /start")
+        return
+
+    if opponent[0] == message.from_user.id:
+        await message.answer("❌ Нельзя играть сам с собой! 😄")
+        return
+
+    winner_id = message.from_user.id if result == "win" else opponent[0]
+    loser_id = opponent[0] if result == "win" else message.from_user.id
+
+    # Записываем матч
+    success, data = await record_match(winner_id, loser_id)
+    
+    if success:
+        new_winner_elo = data[0]
+        new_loser_elo = data[1]
+        
+        winner_name = message.from_user.full_name if result == "win" else opponent[2]
+        loser_name = opponent[2] if result == "win" else message.from_user.full_name
+        
+        await message.answer(
+            f"✅ **Матч записан!**\n\n"
+            f"🏆 Победитель: {winner_name} (новый рейтинг: **{new_winner_elo}**)\n"
+            f"📉 Проигравший: {loser_name} (новый рейтинг: **{new_loser_elo}**)\n\n"
+            f"Проверь обновленный топ командой /top"
+        )
+    else:
+        await message.answer(f"❌ Ошибка при записи: {data}")
 
 async def main():
     # Инициализируем базу данных
