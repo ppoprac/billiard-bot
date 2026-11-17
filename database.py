@@ -1,91 +1,126 @@
-import aiosqlite
+import os
 import math
+import asyncpg
 
-DB_PATH = "billiard_bot.db"
+DATABASE_URL = os.getenv("DATABASE_URL")
 MATCH_COOLDOWN_MINUTES = 30
 CHALLENGE_RANGE = 10
 
+if not DATABASE_URL:
+    raise RuntimeError("Переменная DATABASE_URL не установлена")
+
+_pool = None
+
 
 async def init_db():
-    """Создаёт таблицы в базе данных"""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''
+    """Создаёт пул соединений и таблицы (вызывается один раз при старте)"""
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=10,
+            statement_cache_size=0,  # совместимость с Supabase pooler
+        )
+    async with _pool.acquire() as conn:
+        await conn.execute('''
             CREATE TABLE IF NOT EXISTS users (
-                telegram_id INTEGER PRIMARY KEY,
+                telegram_id BIGINT PRIMARY KEY,
                 username TEXT,
                 full_name TEXT,
                 elo_rating INTEGER DEFAULT 1000,
                 games_played INTEGER DEFAULT 0,
                 wins INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMPTZ DEFAULT NOW()
             )
         ''')
-        await db.execute('''
+        await conn.execute('''
             CREATE TABLE IF NOT EXISTS matches (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                winner_id INTEGER NOT NULL,
-                loser_id INTEGER NOT NULL,
-                played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                id SERIAL PRIMARY KEY,
+                winner_id BIGINT NOT NULL,
+                loser_id BIGINT NOT NULL,
+                played_at TIMESTAMPTZ DEFAULT NOW()
             )
         ''')
-        await db.execute('''
+        await conn.execute('''
             CREATE TABLE IF NOT EXISTS challenges (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                challenger_id INTEGER NOT NULL,
-                opponent_id INTEGER NOT NULL,
+                id SERIAL PRIMARY KEY,
+                challenger_id BIGINT NOT NULL,
+                opponent_id BIGINT NOT NULL,
                 status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMPTZ DEFAULT NOW()
             )
         ''')
-        await db.execute('''
+        await conn.execute('''
             CREATE TABLE IF NOT EXISTS pending_results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                winner_id INTEGER NOT NULL,
-                loser_id INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                id SERIAL PRIMARY KEY,
+                winner_id BIGINT NOT NULL,
+                loser_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
             )
         ''')
-        await db.commit()
 
+
+async def close_pool():
+    """Закрывает пул при остановке сервиса"""
+    global _pool
+    if _pool is not None:
+        await _pool.close()
+        _pool = None
+
+
+# === USERS ===
 
 async def get_or_create_user(telegram_id: int, username: str, full_name: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            'SELECT * FROM users WHERE telegram_id = ?',
-            (telegram_id,)
+    async with _pool.acquire() as conn:
+        user = await conn.fetchrow(
+            'SELECT * FROM users WHERE telegram_id = $1', telegram_id
         )
-        user = await cursor.fetchone()
         if not user:
-            await db.execute(
-                'INSERT INTO users (telegram_id, username, full_name) VALUES (?, ?, ?)',
-                (telegram_id, username, full_name)
+            await conn.execute(
+                'INSERT INTO users (telegram_id, username, full_name) VALUES ($1, $2, $3) '
+                'ON CONFLICT (telegram_id) DO NOTHING',
+                telegram_id, username, full_name
             )
-            await db.commit()
-            cursor = await db.execute(
-                'SELECT * FROM users WHERE telegram_id = ?',
-                (telegram_id,)
+            user = await conn.fetchrow(
+                'SELECT * FROM users WHERE telegram_id = $1', telegram_id
             )
-            user = await cursor.fetchone()
         return user
 
 
 async def get_user_profile(telegram_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            'SELECT * FROM users WHERE telegram_id = ?',
-            (telegram_id,)
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow(
+            'SELECT * FROM users WHERE telegram_id = $1', telegram_id
         )
-        return await cursor.fetchone()
 
 
 async def get_top_players(limit: int = 10):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            'SELECT * FROM users ORDER BY elo_rating DESC, telegram_id ASC LIMIT ?',
-            (limit,)
+    async with _pool.acquire() as conn:
+        return await conn.fetch(
+            'SELECT * FROM users ORDER BY elo_rating DESC, telegram_id ASC LIMIT $1',
+            limit
         )
-        return await cursor.fetchall()
 
+
+async def get_user_by_username(username: str):
+    username = username.lstrip('@')
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow(
+            'SELECT * FROM users WHERE username = $1', username
+        )
+
+
+async def get_all_users(limit: int = 30):
+    async with _pool.acquire() as conn:
+        return await conn.fetch(
+            'SELECT telegram_id, username, full_name, elo_rating FROM users '
+            'ORDER BY elo_rating DESC, telegram_id ASC LIMIT $1',
+            limit
+        )
+
+
+# === ELO ===
 
 def calculate_elo(winner_elo: int, loser_elo: int, k_factor: int = 32):
     expected_winner = 1 / (1 + math.pow(10, (loser_elo - winner_elo) / 400))
@@ -95,80 +130,102 @@ def calculate_elo(winner_elo: int, loser_elo: int, k_factor: int = 32):
     return new_winner_elo, new_loser_elo
 
 
-async def get_user_by_username(username: str):
-    username = username.lstrip('@')
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute('SELECT * FROM users WHERE username = ?', (username,))
-        return await cursor.fetchone()
-
+# === MATCHES ===
 
 async def record_match(winner_id: int, loser_id: int):
     """Возвращает (success, data). data = (new_w_elo, new_l_elo) или строка ошибки."""
     if winner_id == loser_id:
         return False, "Нельзя записать матч с самим собой"
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            '''SELECT id FROM matches 
-               WHERE ((winner_id = ? AND loser_id = ?) OR (winner_id = ? AND loser_id = ?))
-               AND played_at > datetime('now', ?)''',
-            (winner_id, loser_id, loser_id, winner_id, f'-{MATCH_COOLDOWN_MINUTES} minutes')
+    async with _pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            f'''SELECT id FROM matches 
+                WHERE ((winner_id = $1 AND loser_id = $2) 
+                    OR (winner_id = $3 AND loser_id = $4))
+                AND played_at > NOW() - INTERVAL '{MATCH_COOLDOWN_MINUTES} minutes' ''',
+            winner_id, loser_id, loser_id, winner_id
         )
-        if await cursor.fetchone():
+        if existing:
             return False, f"Матч между вами уже записан менее {MATCH_COOLDOWN_MINUTES} минут назад"
 
-        cursor = await db.execute(
-            'SELECT elo_rating FROM users WHERE telegram_id = ?', (winner_id,)
+        winner_data = await conn.fetchrow(
+            'SELECT elo_rating FROM users WHERE telegram_id = $1', winner_id
         )
-        winner_data = await cursor.fetchone()
-        cursor = await db.execute(
-            'SELECT elo_rating FROM users WHERE telegram_id = ?', (loser_id,)
+        loser_data = await conn.fetchrow(
+            'SELECT elo_rating FROM users WHERE telegram_id = $1', loser_id
         )
-        loser_data = await cursor.fetchone()
         if not winner_data or not loser_data:
             return False, "Один из игроков не найден в базе"
 
-        new_winner_elo, new_loser_elo = calculate_elo(winner_data[0], loser_data[0])
-        await db.execute(
-            'UPDATE users SET elo_rating = ?, games_played = games_played + 1, wins = wins + 1 '
-            'WHERE telegram_id = ?',
-            (new_winner_elo, winner_id)
+        new_winner_elo, new_loser_elo = calculate_elo(
+            winner_data['elo_rating'], loser_data['elo_rating']
         )
-        await db.execute(
-            'UPDATE users SET elo_rating = ?, games_played = games_played + 1 '
-            'WHERE telegram_id = ?',
-            (new_loser_elo, loser_id)
-        )
-        await db.execute(
-            'INSERT INTO matches (winner_id, loser_id) VALUES (?, ?)',
-            (winner_id, loser_id)
-        )
-        await db.commit()
+
+        async with conn.transaction():
+            await conn.execute(
+                'UPDATE users SET elo_rating = $1, games_played = games_played + 1, '
+                'wins = wins + 1 WHERE telegram_id = $2',
+                new_winner_elo, winner_id
+            )
+            await conn.execute(
+                'UPDATE users SET elo_rating = $1, games_played = games_played + 1 '
+                'WHERE telegram_id = $2',
+                new_loser_elo, loser_id
+            )
+            await conn.execute(
+                'INSERT INTO matches (winner_id, loser_id) VALUES ($1, $2)',
+                winner_id, loser_id
+            )
+
         return True, (new_winner_elo, new_loser_elo)
 
 
-async def get_all_users(limit: int = 30):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            'SELECT telegram_id, username, full_name, elo_rating FROM users '
-            'ORDER BY elo_rating DESC, telegram_id ASC LIMIT ?',
-            (limit,)
+# === RANK / TOP ===
+
+async def get_total_players() -> int:
+    async with _pool.acquire() as conn:
+        return await conn.fetchval('SELECT COUNT(*) FROM users')
+
+
+async def get_user_rank(telegram_id: int):
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            'SELECT elo_rating FROM users WHERE telegram_id = $1', telegram_id
         )
-        return await cursor.fetchall()
+        if not row:
+            return None
+        user_elo = row['elo_rating']
+        count = await conn.fetchval(
+            '''SELECT COUNT(*) FROM users 
+               WHERE elo_rating > $1 
+               OR (elo_rating = $1 AND telegram_id < $2)''',
+            user_elo, telegram_id
+        )
+        return count + 1
+
+
+async def get_players_upto(max_rank: int):
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            'SELECT telegram_id, username, full_name, elo_rating FROM users '
+            'ORDER BY elo_rating DESC, telegram_id ASC LIMIT $1',
+            max_rank
+        )
+        return [
+            (i + 1, r['telegram_id'], r['username'], r['full_name'], r['elo_rating'])
+            for i, r in enumerate(rows)
+        ]
 
 
 async def get_players_above(telegram_id: int, max_above: int = CHALLENGE_RANGE):
-    """Список игроков выше telegram_id по рейтингу (не более max_above позиций).
-    Формат: [(rank, tid, uname, fname, elo), ...] — от ближайшего к самому высокому."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
             'SELECT telegram_id, username, full_name, elo_rating FROM users '
             'ORDER BY elo_rating DESC, telegram_id ASC'
         )
-        rows = await cursor.fetchall()
         user_index = None
         for i, row in enumerate(rows):
-            if row[0] == telegram_id:
+            if row['telegram_id'] == telegram_id:
                 user_index = i
                 break
         if user_index is None or user_index == 0:
@@ -177,134 +234,85 @@ async def get_players_above(telegram_id: int, max_above: int = CHALLENGE_RANGE):
         result = []
         for i in range(user_index - 1, start - 1, -1):
             rank = i + 1
-            tid, uname, fname, elo = rows[i]
-            result.append((rank, tid, uname, fname, elo))
+            r = rows[i]
+            result.append((rank, r['telegram_id'], r['username'], r['full_name'], r['elo_rating']))
         return result
 
 
-# === Функции для нового /top ===
-
-async def get_total_players() -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute('SELECT COUNT(*) FROM users')
-        row = await cursor.fetchone()
-        return row[0] if row else 0
-
-
-async def get_user_rank(telegram_id: int):
-    """Позиция пользователя в рейтинге (1 = первый). None если не найден."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            'SELECT elo_rating FROM users WHERE telegram_id = ?', (telegram_id,)
-        )
-        row = await cursor.fetchone()
-        if not row:
-            return None
-        user_elo = row[0]
-        cursor = await db.execute(
-            '''SELECT COUNT(*) FROM users 
-               WHERE elo_rating > ? 
-               OR (elo_rating = ? AND telegram_id < ?)''',
-            (user_elo, user_elo, telegram_id)
-        )
-        count_row = await cursor.fetchone()
-        return count_row[0] + 1
-
-
-async def get_players_upto(max_rank: int):
-    """Список (rank, tid, uname, fname, elo) от 1-го до max_rank."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            'SELECT telegram_id, username, full_name, elo_rating FROM users '
-            'ORDER BY elo_rating DESC, telegram_id ASC LIMIT ?',
-            (max_rank,)
-        )
-        rows = await cursor.fetchall()
-        return [(i + 1, row[0], row[1], row[2], row[3]) for i, row in enumerate(rows)]
-
-
-# === Challenges ===
+# === CHALLENGES ===
 
 async def create_challenge(challenger_id: int, opponent_id: int):
     if challenger_id == opponent_id:
         return False, "Нельзя вызвать самого себя"
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
+    async with _pool.acquire() as conn:
+        await conn.execute(
             "DELETE FROM challenges WHERE status = 'pending' "
-            "AND created_at < datetime('now', '-24 hours')"
+            "AND created_at < NOW() - INTERVAL '24 hours'"
         )
-        cursor = await db.execute(
-            "SELECT id FROM challenges WHERE challenger_id = ? AND opponent_id = ? "
+        existing = await conn.fetchrow(
+            "SELECT id FROM challenges WHERE challenger_id = $1 AND opponent_id = $2 "
             "AND status = 'pending'",
-            (challenger_id, opponent_id)
+            challenger_id, opponent_id
         )
-        if await cursor.fetchone():
-            await db.commit()
+        if existing:
             return False, "Ты уже отправил вызов этому игроку, жди ответа"
-        await db.execute(
-            'INSERT INTO challenges (challenger_id, opponent_id) VALUES (?, ?)',
-            (challenger_id, opponent_id)
+        challenge_id = await conn.fetchval(
+            'INSERT INTO challenges (challenger_id, opponent_id) VALUES ($1, $2) '
+            'RETURNING id',
+            challenger_id, opponent_id
         )
-        await db.commit()
-        cursor = await db.execute('SELECT last_insert_rowid()')
-        row = await cursor.fetchone()
-        return True, row[0]
+        return True, challenge_id
 
 
 async def get_challenge(challenge_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            'SELECT id, challenger_id, opponent_id, status FROM challenges WHERE id = ?',
-            (challenge_id,)
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow(
+            'SELECT id, challenger_id, opponent_id, status FROM challenges WHERE id = $1',
+            challenge_id
         )
-        return await cursor.fetchone()
 
 
 async def update_challenge_status(challenge_id: int, status: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            'UPDATE challenges SET status = ? WHERE id = ?',
-            (status, challenge_id)
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            'UPDATE challenges SET status = $1 WHERE id = $2',
+            status, challenge_id
         )
-        await db.commit()
 
 
-# === Pending results ===
+# === PENDING RESULTS ===
 
 async def create_pending_result(winner_id: int, loser_id: int):
     if winner_id == loser_id:
         return False, "Нельзя выбрать самого себя"
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "DELETE FROM pending_results WHERE created_at < datetime('now', '-24 hours')"
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM pending_results WHERE created_at < NOW() - INTERVAL '24 hours'"
         )
-        cursor = await db.execute(
-            'SELECT id FROM pending_results WHERE winner_id = ? AND loser_id = ?',
-            (winner_id, loser_id)
+        existing = await conn.fetchrow(
+            'SELECT id FROM pending_results WHERE winner_id = $1 AND loser_id = $2',
+            winner_id, loser_id
         )
-        if await cursor.fetchone():
-            await db.commit()
+        if existing:
             return False, "Результат уже ожидает подтверждения от этого игрока"
-        await db.execute(
-            'INSERT INTO pending_results (winner_id, loser_id) VALUES (?, ?)',
-            (winner_id, loser_id)
+        pending_id = await conn.fetchval(
+            'INSERT INTO pending_results (winner_id, loser_id) VALUES ($1, $2) '
+            'RETURNING id',
+            winner_id, loser_id
         )
-        await db.commit()
-        cursor = await db.execute('SELECT last_insert_rowid()')
-        row = await cursor.fetchone()
-        return True, row[0]
+        return True, pending_id
 
 
 async def get_pending_result(pending_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            'SELECT id, winner_id, loser_id FROM pending_results WHERE id = ?',
-            (pending_id,)
+    async with _pool.acquire() as conn:
+        return await conn.fetchrow(
+            'SELECT id, winner_id, loser_id FROM pending_results WHERE id = $1',
+            pending_id
         )
-        return await cursor.fetchone()
 
 
 async def delete_pending_result(pending_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('DELETE FROM pending_results WHERE id = ?', (pending_id,))
-        await db.commit()
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            'DELETE FROM pending_results WHERE id = $1', pending_id
+        )
