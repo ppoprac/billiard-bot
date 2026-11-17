@@ -1,7 +1,8 @@
 import os
 import logging
 import asyncio
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart, Command
 from database import init_db, get_or_create_user, get_user_profile, get_top_players, get_user_by_username, record_match
 
@@ -86,51 +87,68 @@ async def cmd_help(message: types.Message):
 
 @dp.message(Command("match"))
 async def cmd_match(message: types.Message):
-    # Ожидаем формат: /match @никнейм win (или lose)
     args = message.text.split()
     
-    if len(args) < 3:
-        await message.answer("⚠️ Неверный формат.\nИспользуй: `/match @никнейм win`\n(где win означает, что ТЫ выиграл)", parse_mode="Markdown")
+    if len(args) < 2:
+        await message.answer("⚠️ Напиши ник соперника. Пример: `/match @ivan`", parse_mode="Markdown")
         return
 
     opponent_username = args[1]
-    result = args[2].lower()
-
-    if result not in ["win", "lose"]:
-        await message.answer("⚠️ Результат должен быть `win` (ты выиграл) или `lose` (ты проиграл)")
-        return
-
-    # Ищем соперника в базе
     opponent = await get_user_by_username(opponent_username)
+    
     if not opponent:
-        await message.answer(f"❌ Игрок с ником {opponent_username} не найден в базе. Возможно, он ещё не писал боту /start")
+        await message.answer(f"❌ Игрок {opponent_username} не найден. Пусть он сначала напишет боту /start")
         return
 
     if opponent[0] == message.from_user.id:
         await message.answer("❌ Нельзя играть сам с собой! 😄")
         return
 
-    winner_id = message.from_user.id if result == "win" else opponent[0]
-    loser_id = opponent[0] if result == "win" else message.from_user.id
+    # Создаем красивые кнопки
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Я выиграл", callback_data=f"match_win_{opponent[0]}"),
+            InlineKeyboardButton(text="❌ Я проиграл", callback_data=f"match_lose_{opponent[0]}")
+        ]
+    ])
 
-    # Записываем матч
+    await message.answer(
+        f"🎱 **Матч против:** {opponent[2]}\n"
+        f"📊 Его рейтинг: **{opponent[3]}** ELO\n\n"
+        f"Как прошел матч?",
+        reply_markup=keyboard
+    )
+
+# Обработчик нажатий на кнопки
+@dp.callback_query(F.data.startswith("match_"))
+async def process_match_result(callback: CallbackQuery):
+    # Разбираем данные кнопки (например, match_win_123456789)
+    parts = callback.data.split("_")
+    result = parts[1]  # win или lose
+    opponent_id = int(parts[2])
+    
+    winner_id = callback.from_user.id if result == "win" else opponent_id
+    loser_id = opponent_id if result == "win" else callback.from_user.id
+
     success, data = await record_match(winner_id, loser_id)
     
     if success:
         new_winner_elo = data[0]
         new_loser_elo = data[1]
         
-        winner_name = message.from_user.full_name if result == "win" else opponent[2]
-        loser_name = opponent[2] if result == "win" else message.from_user.full_name
+        winner_name = callback.from_user.full_name if result == "win" else "Соперник"
+        loser_name = "Соперник" if result == "win" else callback.from_user.full_name
         
-        await message.answer(
-            f"✅ **Матч записан!**\n\n"
-            f"🏆 Победитель: {winner_name} (новый рейтинг: **{new_winner_elo}**)\n"
-            f"📉 Проигравший: {loser_name} (новый рейтинг: **{new_loser_elo}**)\n\n"
-            f"Проверь обновленный топ командой /top"
-        )
+        text = (f"✅ **Результат записан!**\n\n"
+                f"🏆 Победитель: {winner_name} (теперь **{new_winner_elo}** ELO)\n"
+                f"📉 Проигравший: {loser_name} (теперь **{new_loser_elo}** ELO)")
+        
+        # Заменяем сообщение с кнопками на текст результата
+        await callback.message.edit_text(text)
     else:
-        await message.answer(f"❌ Ошибка при записи: {data}")
+        await callback.answer("❌ Ошибка при записи матча", show_alert=True)
+        
+    await callback.answer() # Убираем "часики" на кнопке
 
 async def main():
     # Инициализируем базу данных
