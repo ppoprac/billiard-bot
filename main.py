@@ -9,6 +9,7 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 
 from database import (
     init_db,
+    close_pool,
     get_or_create_user,
     get_user_profile,
     get_all_users,
@@ -43,7 +44,7 @@ dp = Dispatcher()
 
 
 def display_name(row):
-    return row[2] or row[1] or "Аноним"
+    return row['full_name'] or row['username'] or "Аноним"
 
 
 # ================== БАЗОВЫЕ КОМАНДЫ ==================
@@ -57,8 +58,8 @@ async def cmd_start(message: types.Message):
     )
     await message.answer(
         f"Привет, {message.from_user.full_name}! 🎱\n\n"
-        f"📊 Твой рейтинг: <b>{user[3]}</b> ELO\n"
-        f"🎮 Игр: {user[4]} | 🏆 Побед: {user[5]}\n\n"
+        f"📊 Твой рейтинг: <b>{user['elo_rating']}</b> ELO\n"
+        f"🎮 Игр: {user['games_played']} | 🏆 Побед: {user['wins']}\n\n"
         f"👇 Команды:\n"
         f"/match — Записать поражение\n"
         f"/result — Записать победу\n"
@@ -76,15 +77,15 @@ async def cmd_profile(message: types.Message):
     if not user:
         await message.answer("Сначала напиши /start")
         return
-    winrate = (user[5] / user[4] * 100) if user[4] > 0 else 0
+    winrate = (user['wins'] / user['games_played'] * 100) if user['games_played'] > 0 else 0
     await message.answer(
         f"📊 <b>Твой профиль</b>\n\n"
-        f"👤 Имя: {user[2]}\n"
-        f"📈 Рейтинг ELO: <b>{user[3]}</b>\n"
-        f"🎮 Сыграно игр: {user[4]}\n"
-        f"🏆 Побед: {user[5]}\n"
+        f"👤 Имя: {user['full_name']}\n"
+        f"📈 Рейтинг ELO: <b>{user['elo_rating']}</b>\n"
+        f"🎮 Сыграно игр: {user['games_played']}\n"
+        f"🏆 Побед: {user['wins']}\n"
         f"📉 Процент побед: {winrate:.1f}%\n"
-        f"📅 Регистрация: {user[6]}",
+        f"📅 Регистрация: {user['created_at']}",
         parse_mode="HTML",
     )
 
@@ -125,12 +126,10 @@ async def cmd_top(message: types.Message):
         return
 
     if total <= 30 or user_rank <= 30:
-        # Всё помещается (или пользователь в топ-30 — показываем первые 30)
         show_upto = min(30, total)
         players = await get_players_upto(show_upto)
         display_ranks = list(range(1, len(players) + 1))
     else:
-        # Пользователь ниже 30-го — окно вокруг него
         show_upto = min(user_rank + 5, total)
         players = await get_players_upto(show_upto)
 
@@ -178,15 +177,15 @@ async def cmd_match(message: types.Message):
         return
 
     players = await get_all_users(30)
-    players = [p for p in players if p[0] != message.from_user.id]
+    players = [p for p in players if p['telegram_id'] != message.from_user.id]
     if not players:
         await message.answer("Пока не с кем играть")
         return
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text=f"🎱 {display_name(p)} ({p[3]} ELO)",
-            callback_data=f"select_opp_{p[0]}",
+            text=f"🎱 {display_name(p)} ({p['elo_rating']} ELO)",
+            callback_data=f"select_opp_{p['telegram_id']}",
         )] for p in players
     ])
     await message.answer(
@@ -253,14 +252,14 @@ async def cmd_result(message: types.Message):
         await message.answer("Сначала напиши /start")
         return
     players = await get_all_users(30)
-    players = [p for p in players if p[0] != message.from_user.id]
+    players = [p for p in players if p['telegram_id'] != message.from_user.id]
     if not players:
         await message.answer("Пока нет других игроков")
         return
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text=f"🏆 {display_name(p)} ({p[3]} ELO)",
-            callback_data=f"result_select_{p[0]}",
+            text=f"🏆 {display_name(p)} ({p['elo_rating']} ELO)",
+            callback_data=f"result_select_{p['telegram_id']}",
         )] for p in players
     ])
     await message.answer(
@@ -324,7 +323,8 @@ async def process_result_confirm(callback: CallbackQuery):
         await callback.message.edit_text("❌ Запрос устарел или уже обработан.")
         await callback.answer()
         return
-    _, winner_id, loser_id = pending
+    winner_id = pending['winner_id']
+    loser_id = pending['loser_id']
     if callback.from_user.id != loser_id:
         await callback.answer("Это не твой запрос", show_alert=True)
         return
@@ -359,7 +359,8 @@ async def process_result_decline(callback: CallbackQuery):
         await callback.message.edit_text("❌ Запрос устарел.")
         await callback.answer()
         return
-    _, winner_id, loser_id = pending
+    winner_id = pending['winner_id']
+    loser_id = pending['loser_id']
     if callback.from_user.id != loser_id:
         await callback.answer("Это не твой запрос", show_alert=True)
         return
@@ -431,7 +432,7 @@ async def process_challenge_select(callback: CallbackQuery):
         await bot.send_message(
             opponent_id,
             f"⚔️ <b>{display_name(challenger)}</b> вызывает тебя на матч!\n"
-            f"Рейтинг вызывающего: <b>{challenger[3]}</b> ELO",
+            f"Рейтинг вызывающего: <b>{challenger['elo_rating']}</b> ELO",
             reply_markup=keyboard,
             parse_mode="HTML",
         )
@@ -452,11 +453,12 @@ async def process_challenge_select(callback: CallbackQuery):
 async def process_challenge_accept(callback: CallbackQuery):
     challenge_id = int(callback.data.removeprefix("challenge_accept_"))
     challenge = await get_challenge(challenge_id)
-    if not challenge or challenge[3] != "pending":
+    if not challenge or challenge['status'] != "pending":
         await callback.message.edit_text("❌ Вызов устарел или уже обработан.")
         await callback.answer()
         return
-    _, challenger_id, opponent_id, _ = challenge
+    challenger_id = challenge['challenger_id']
+    opponent_id = challenge['opponent_id']
     if callback.from_user.id != opponent_id:
         await callback.answer("Это не твой вызов", show_alert=True)
         return
@@ -484,11 +486,12 @@ async def process_challenge_accept(callback: CallbackQuery):
 async def process_challenge_decline(callback: CallbackQuery):
     challenge_id = int(callback.data.removeprefix("challenge_decline_"))
     challenge = await get_challenge(challenge_id)
-    if not challenge or challenge[3] != "pending":
+    if not challenge or challenge['status'] != "pending":
         await callback.message.edit_text("❌ Вызов устарел или уже обработан.")
         await callback.answer()
         return
-    _, challenger_id, opponent_id, _ = challenge
+    challenger_id = challenge['challenger_id']
+    opponent_id = challenge['opponent_id']
     if callback.from_user.id != opponent_id:
         await callback.answer("Это не твой вызов", show_alert=True)
         return
@@ -514,12 +517,19 @@ async def on_startup(bot: Bot):
     logging.info(f"Webhook установлен: {WEBHOOK_URL}")
 
 
+async def on_shutdown(bot: Bot):
+    logging.info("Закрываем пул соединений с БД...")
+    await close_pool()
+
+
 async def healthcheck(request: web.Request):
     return web.Response(text="OK")
 
 
 def main():
     dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+
     app = web.Application()
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     app.router.add_get("/", healthcheck)
