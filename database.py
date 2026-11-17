@@ -111,3 +111,12 @@ async def record_match(winner_id: int, loser_id: int):
         
         await db.commit()
         return True, new_winner_elo, new_loser_elo
+
+async def get_all_users(limit=30):
+    """Возвращает список игроков для выбора соперника"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            'SELECT telegram_id, username, full_name, elo_rating FROM users ORDER BY elo_rating DESC LIMIT ?', 
+            (limit,)
+        )
+        return await cursor.fetchall()
