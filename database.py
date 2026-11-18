@@ -99,7 +99,6 @@ async def get_user_profile(telegram_id: int):
 
 async def get_top_players(limit: int = 10):
     async with _pool.acquire() as conn:
-        # Исключаем забаненных
         return await conn.fetch(
             'SELECT * FROM users WHERE is_banned = FALSE ORDER BY elo_rating DESC, telegram_id ASC LIMIT $1',
             limit
@@ -314,9 +313,7 @@ async def admin_ban_user(telegram_id: int, ban: bool = True):
 
 async def admin_delete_user(telegram_id: int):
     async with _pool.acquire() as conn:
-        # Удаляем пользователя из таблицы. Матчи остаются (имена будут "Удаленный игрок").
         status = await conn.execute('DELETE FROM users WHERE telegram_id = $1', telegram_id)
-        # Чистим его зависшие вызовы и запросы
         await conn.execute('DELETE FROM challenges WHERE challenger_id = $1 OR opponent_id = $1', telegram_id)
         await conn.execute('DELETE FROM pending_results WHERE winner_id = $1 OR loser_id = $1', telegram_id)
         return status != "DELETE 0"
