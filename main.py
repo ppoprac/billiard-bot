@@ -110,6 +110,7 @@ async def check_ban(message: types.Message):
     if user and user['is_banned']:
         await message.answer("🚫 Вы заблокированы. Доступ к командам закрыт.")
         return
+    # Если не забанен, пропускаем дальше
     raise SkipHandler() 
 
 # ================== СИСТЕМА ЖАЛОБ ==================
@@ -159,6 +160,10 @@ async def process_report_target(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(ReportStates.waiting_for_reason)
 async def process_report_reason(message: types.Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Пожалуйста, отправь текстовое сообщение с причиной.")
+        return
+        
     data = await state.get_data()
     target_id = data.get("target_id")
     reason = message.text
@@ -175,7 +180,6 @@ async def process_report_reason(message: types.Message, state: FSMContext):
     reporter = await get_user_profile(message.from_user.id)
     reporter_name = display_name(reporter)
     
-    # Отправляем жалобу админу
     admin_text = (
         f"🚨 <b>НОВАЯ ЖАЛОБА</b>\n\n"
         f"👤 <b>От кого:</b> {reporter_name} (ID: <code>{message.from_user.id}</code>)\n"
