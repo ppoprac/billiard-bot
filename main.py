@@ -1,14 +1,14 @@
 import os
 import logging
+from typing import Callable, Dict, Any, Awaitable
 from aiohttp import web
 
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart, Command
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.dispatcher.event.bases import SkipHandler
 
 from database import (
     init_db, close_pool, get_or_create_user, get_user_profile, get_all_users,
@@ -24,7 +24,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL")
 ADMIN_ID = os.getenv("ADMIN_ID")
 if ADMIN_ID:
-    ADMIN_ID = ADMIN_ID.strip() # Убираем случайные пробелы
+    ADMIN_ID = ADMIN_ID.strip()
 
 PORT = int(os.getenv("PORT", 8080))
 WEBHOOK_PATH = "/webhook"
@@ -32,8 +32,6 @@ WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
 if not BOT_TOKEN:
     raise RuntimeError("Переменная BOT_TOKEN не установлена")
-if not ADMIN_ID:
-    logging.warning("ВНИМАНИЕ: Переменная ADMIN_ID не установлена! Жалобы не будут приходить.")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -41,6 +39,28 @@ dp = Dispatcher()
 # Машина состояний для жалоб
 class ReportStates(StatesGroup):
     waiting_for_reason = State()
+
+# Мидлварь для проверки бана
+class BanCheckMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[types.Message, Dict[str, Any]], Awaitable[Any]],
+        event: types.Message,
+        data: Dict[str, Any]
+    ) -> Any:
+        # Пропускаем /start, чтобы человек увидел, что он забанен
+        if event.text and event.text.startswith("/start"):
+            return await handler(event, data)
+            
+        user = await get_user_profile(event.from_user.id)
+        if user and user['is_banned']:
+            await event.answer("🚫 Вы заблокированы. Доступ к командам закрыт.")
+            return # Прерываем обработку
+            
+        return await handler(event, data)
+
+# Подключаем мидлварь
+dp.message.outer_middleware(BanCheckMiddleware())
 
 def display_name(row):
     return row['full_name'] or row['username'] or "Аноним"
@@ -92,8 +112,7 @@ async def cmd_help(message: types.Message):
         "/challenge — Вызвать игрока (до 10 позиций)\n"
         "/history — Твои последние 10 матчей\n"
         "/h2h — Статистика личных встреч\n"
-        "/report — Пожаловаться на нарушителя\n"
-        "/help — Эта справка",
+        "/report — Пожаловаться на нарушителя",
         parse_mode="HTML",
     )
 
@@ -105,20 +124,25 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("❌ Действие отменено.")
 
-# Перехватываем все команды, чтобы забаненные не могли ими пользоваться
-@dp.message(F.text.startswith("/"))
-async def check_ban(message: types.Message):
-    # Если команда в белом списке — ПРОПУСКАЕМ её к нужному хэндлеру
-    if message.text.startswith(("/start", "/help", "/admin", "/cancel", "/report")):
-        raise SkipHandler() 
-        
+# ================== /profile ==================
+
+@dp.message(Command("profile"))
+async def cmd_profile(message: types.Message):
     user = await get_user_profile(message.from_user.id)
-    if user and user['is_banned']:
-        await message.answer("🚫 Вы заблокированы. Доступ к командам закрыт.")
-        return # Поглощаем команду
-        
-    # Если не забанен — пропускаем дальше
-    raise SkipHandler() 
+    if not user:
+        await message.answer("Сначала напиши /start")
+        return
+    winrate = (user['wins'] / user['games_played'] * 100) if user['games_played'] > 0 else 0
+    await message.answer(
+        f"📊 <b>Твой профиль</b>\n\n"
+        f"👤 Имя: {user['full_name']}\n"
+        f"📈 Рейтинг ELO: <b>{user['elo_rating']}</b>\n"
+        f"🎮 Сыграно игр: {user['games_played']}\n"
+        f"🏆 Побед: {user['wins']}\n"
+        f"📉 Процент побед: {winrate:.1f}%\n"
+        f"📅 Регистрация: {user['created_at'].strftime('%d.%m.%Y')}",
+        parse_mode="HTML",
+    )
 
 # ================== СИСТЕМА ЖАЛОБ ==================
 
