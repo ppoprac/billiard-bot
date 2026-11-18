@@ -23,6 +23,9 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL")
 ADMIN_ID = os.getenv("ADMIN_ID")
+if ADMIN_ID:
+    ADMIN_ID = ADMIN_ID.strip() # Убираем случайные пробелы
+
 PORT = int(os.getenv("PORT", 8080))
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
@@ -43,13 +46,14 @@ def display_name(row):
     return row['full_name'] or row['username'] or "Аноним"
 
 def is_admin(user_id: int) -> bool:
-    return ADMIN_ID and str(user_id) == str(ADMIN_ID)
+    if not ADMIN_ID: return False
+    return str(user_id) == str(ADMIN_ID)
 
 # ================== БАЗОВЫЕ КОМАНДЫ ==================
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
-    await state.clear() # Сбрасываем состояния при старте
+    await state.clear()
     user = await get_or_create_user(
         message.from_user.id,
         message.from_user.username or "Не указан",
@@ -104,13 +108,16 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
 # Перехватываем все команды, чтобы забаненные не могли ими пользоваться
 @dp.message(F.text.startswith("/"))
 async def check_ban(message: types.Message):
-    if message.text.startswith(("/start", "/help", "/admin", "/cancel")): 
-        return 
+    # Если команда в белом списке — ПРОПУСКАЕМ её к нужному хэндлеру
+    if message.text.startswith(("/start", "/help", "/admin", "/cancel", "/report")):
+        raise SkipHandler() 
+        
     user = await get_user_profile(message.from_user.id)
     if user and user['is_banned']:
         await message.answer("🚫 Вы заблокированы. Доступ к командам закрыт.")
-        return
-    # Если не забанен, пропускаем дальше
+        return # Поглощаем команду
+        
+    # Если не забанен — пропускаем дальше
     raise SkipHandler() 
 
 # ================== СИСТЕМА ЖАЛОБ ==================
