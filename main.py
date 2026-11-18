@@ -18,6 +18,8 @@ from database import (
     get_user_rank,
     get_players_upto,
     record_match,
+    get_match_history,
+    get_h2h_stats,
     create_challenge,
     get_challenge,
     update_challenge_status,
@@ -66,6 +68,8 @@ async def cmd_start(message: types.Message):
         f"/challenge — Вызвать соперника\n"
         f"/top — Таблица рейтинга\n"
         f"/profile — Твоя статистика\n"
+        f"/history — История матчей\n"
+        f"/h2h — Личные встречи\n"
         f"/help — Все команды",
         parse_mode="HTML",
     )
@@ -85,7 +89,7 @@ async def cmd_profile(message: types.Message):
         f"🎮 Сыграно игр: {user['games_played']}\n"
         f"🏆 Побед: {user['wins']}\n"
         f"📉 Процент побед: {winrate:.1f}%\n"
-        f"📅 Регистрация: {user['created_at']}",
+        f"📅 Регистрация: {user['created_at'].strftime('%d.%m.%Y')}",
         parse_mode="HTML",
     )
 
@@ -100,6 +104,8 @@ async def cmd_help(message: types.Message):
         "/match — Записать поражение (ты проиграл)\n"
         "/result — Записать победу (ты выиграл)\n"
         "/challenge — Вызвать игрока выше тебя (до 10 позиций)\n"
+        "/history — Твои последние 10 матчей\n"
+        "/h2h — Статистика личных встреч\n"
         "/help — Эта справка",
         parse_mode="HTML",
     )
@@ -132,14 +138,12 @@ async def cmd_top(message: types.Message):
     else:
         show_upto = min(user_rank + 5, total)
         players = await get_players_upto(show_upto)
-
         top_ranks = list(range(1, 11))
         above_from = max(11, user_rank - 10)
         above_to = user_rank - 1
         above_ranks = list(range(above_from, above_to + 1)) if above_from <= above_to else []
         me_rank = [user_rank]
         below_ranks = list(range(user_rank + 1, min(user_rank + 5, total) + 1))
-
         display_ranks = top_ranks + above_ranks + me_rank + below_ranks
 
     text = "🏆 <b>Рейтинг игроков</b>\n\n"
@@ -166,6 +170,96 @@ async def cmd_top(message: types.Message):
 
     text += f"\n<i>Всего игроков: {total}</i>\n⬆️ — можешь вызвать через /challenge"
     await message.answer(text, parse_mode="HTML")
+
+
+# ================== /history ==================
+
+@dp.message(Command("history"))
+async def cmd_history(message: types.Message):
+    user = await get_user_profile(message.from_user.id)
+    if not user:
+        await message.answer("Сначала напиши /start")
+        return
+
+    matches = await get_match_history(message.from_user.id, limit=10)
+    if not matches:
+        await message.answer("📭 У тебя пока нет сыгранных матчей.")
+        return
+
+    text = "📜 <b>Твои последние матчи</b>\n\n"
+    for m in matches:
+        date_str = m['played_at'].strftime('%d.%m %H:%M')
+        if m['winner_id'] == message.from_user.id:
+            opp_name = m['loser_name'] or m['loser_username'] or "Аноним"
+            change = m['winner_elo_change']
+            sign = "+" if change >= 0 else ""
+            text += f"✅ {date_str} — Победа над {opp_name} <b>({sign}{change})</b>\n"
+        else:
+            opp_name = m['winner_name'] or m['winner_username'] or "Аноним"
+            change = m['loser_elo_change']
+            text += f"❌ {date_str} — Поражение от {opp_name} <b>({change})</b>\n"
+
+    await message.answer(text, parse_mode="HTML")
+
+
+# ================== /h2h ==================
+
+@dp.message(Command("h2h"))
+async def cmd_h2h(message: types.Message):
+    if not await get_user_profile(message.from_user.id):
+        await message.answer("Сначала напиши /start")
+        return
+
+    players = await get_all_users(30)
+    players = [p for p in players if p['telegram_id'] != message.from_user.id]
+    if not players:
+        await message.answer("Пока нет других игроков для сравнения.")
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"🆚 {display_name(p)}",
+            callback_data=f"h2h_select_{p['telegram_id']}",
+        )] for p in players
+    ])
+    await message.answer(
+        "🆚 <b>С кем сравниваем?</b>\nВыбери соперника, чтобы увидеть статистику личных встреч.",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data.startswith("h2h_select_"))
+async def process_h2h_select(callback: CallbackQuery):
+    opponent_id = int(callback.data.removeprefix("h2h_select_"))
+    user_id = callback.from_user.id
+
+    user = await get_user_profile(user_id)
+    opponent = await get_user_profile(opponent_id)
+    if not user or not opponent:
+        await callback.answer("Игрок не найден", show_alert=True)
+        return
+
+    wins, losses = await get_h2h_stats(user_id, opponent_id)
+    total = wins + losses
+
+    if total == 0:
+        await callback.message.edit_text(
+            f"🆚 Статистика с <b>{display_name(opponent)}</b>:\n\n"
+            f"Вы ещё не играли друг с другом.",
+            parse_mode="HTML"
+        )
+    else:
+        winrate = (wins / total) * 100
+        await callback.message.edit_text(
+            f"🆚 <b>Статистика с {display_name(opponent)}</b>\n\n"
+            f"Всего матчей: {total}\n"
+            f"🏆 Твоих побед: <b>{wins}</b>\n"
+            f"📉 Твоих поражений: <b>{losses}</b>\n"
+            f"📊 Процент побед: {winrate:.1f}%",
+            parse_mode="HTML"
+        )
+    await callback.answer()
 
 
 # ================== /match (проигравший инициирует) ==================
@@ -223,18 +317,18 @@ async def process_confirm_lose(callback: CallbackQuery):
     loser_id = callback.from_user.id
     success, data = await record_match(winner_id, loser_id)
     if success:
-        new_winner_elo, new_loser_elo = data
+        new_winner_elo, new_loser_elo, w_change, l_change = data
         await callback.message.edit_text(
             f"✅ <b>Результат записан!</b>\n\n"
-            f"📉 Твой рейтинг: <b>{new_loser_elo}</b> ELO\n"
-            f"🏆 Рейтинг соперника: <b>{new_winner_elo}</b> ELO",
+            f"📉 Твой рейтинг: <b>{new_loser_elo}</b> ({l_change})\n"
+            f"🏆 Рейтинг соперника: <b>{new_winner_elo}</b> (+{w_change})",
             parse_mode="HTML",
         )
         try:
             await bot.send_message(
                 winner_id,
                 f"🎉 Тебе записали победу!\n"
-                f"🏆 Твой новый рейтинг: <b>{new_winner_elo}</b> ELO",
+                f"🏆 Твой новый рейтинг: <b>{new_winner_elo}</b> (+{w_change})",
                 parse_mode="HTML",
             )
         except Exception:
@@ -331,17 +425,17 @@ async def process_result_confirm(callback: CallbackQuery):
     await delete_pending_result(pending_id)
     success, data = await record_match(winner_id, loser_id)
     if success:
-        new_winner_elo, new_loser_elo = data
+        new_winner_elo, new_loser_elo, w_change, l_change = data
         await callback.message.edit_text(
             f"✅ <b>Подтверждено!</b>\n\n"
-            f"📉 Твой рейтинг: <b>{new_loser_elo}</b> ELO",
+            f"📉 Твой рейтинг: <b>{new_loser_elo}</b> ({l_change})",
             parse_mode="HTML",
         )
         try:
             await bot.send_message(
                 winner_id,
                 f"🎉 Соперник подтвердил твою победу!\n"
-                f"🏆 Твой новый рейтинг: <b>{new_winner_elo}</b> ELO",
+                f"🏆 Твой новый рейтинг: <b>{new_winner_elo}</b> (+{w_change})",
                 parse_mode="HTML",
             )
         except Exception:
