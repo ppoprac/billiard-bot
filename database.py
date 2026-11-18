@@ -5,6 +5,7 @@ import asyncpg
 DATABASE_URL = os.getenv("DATABASE_URL")
 MATCH_COOLDOWN_MINUTES = 30
 CHALLENGE_RANGE = 10
+K_FACTOR = 30  # Коэффициент ELO
 
 if not DATABASE_URL:
     raise RuntimeError("Переменная DATABASE_URL не установлена")
@@ -13,14 +14,14 @@ _pool = None
 
 
 async def init_db():
-    """Создаёт пул соединений и таблицы (вызывается один раз при старте)"""
+    """Создаёт пул соединений и таблицы"""
     global _pool
     if _pool is None:
         _pool = await asyncpg.create_pool(
             DATABASE_URL,
             min_size=1,
             max_size=10,
-            statement_cache_size=0,  # совместимость с Supabase pooler
+            statement_cache_size=0,
         )
     async with _pool.acquire() as conn:
         await conn.execute('''
@@ -42,6 +43,14 @@ async def init_db():
                 played_at TIMESTAMPTZ DEFAULT NOW()
             )
         ''')
+        # Миграция: добавляем колонки для изменения рейтинга, если их ещё нет
+        await conn.execute('''
+            ALTER TABLE matches ADD COLUMN IF NOT EXISTS winner_elo_change INTEGER DEFAULT 0;
+        ''')
+        await conn.execute('''
+            ALTER TABLE matches ADD COLUMN IF NOT EXISTS loser_elo_change INTEGER DEFAULT 0;
+        ''')
+        
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS challenges (
                 id SERIAL PRIMARY KEY,
@@ -62,7 +71,6 @@ async def init_db():
 
 
 async def close_pool():
-    """Закрывает пул при остановке сервиса"""
     global _pool
     if _pool is not None:
         await _pool.close()
@@ -85,6 +93,16 @@ async def get_or_create_user(telegram_id: int, username: str, full_name: str):
             user = await conn.fetchrow(
                 'SELECT * FROM users WHERE telegram_id = $1', telegram_id
             )
+        else:
+            # Автообновление имени, если оно изменилось в Telegram
+            if user['username'] != username or user['full_name'] != full_name:
+                await conn.execute(
+                    'UPDATE users SET username = $1, full_name = $2 WHERE telegram_id = $3',
+                    username, full_name, telegram_id
+                )
+                user = await conn.fetchrow(
+                    'SELECT * FROM users WHERE telegram_id = $1', telegram_id
+                )
         return user
 
 
@@ -122,18 +140,20 @@ async def get_all_users(limit: int = 30):
 
 # === ELO ===
 
-def calculate_elo(winner_elo: int, loser_elo: int, k_factor: int = 32):
+def calculate_elo_change(winner_elo: int, loser_elo: int, k_factor: int = K_FACTOR) -> tuple:
+    """Возвращает (изменение_победителя, изменение_проигравшего)."""
     expected_winner = 1 / (1 + math.pow(10, (loser_elo - winner_elo) / 400))
     expected_loser = 1 / (1 + math.pow(10, (winner_elo - loser_elo) / 400))
-    new_winner_elo = round(winner_elo + k_factor * (1 - expected_winner))
-    new_loser_elo = round(loser_elo + k_factor * (0 - expected_loser))
-    return new_winner_elo, new_loser_elo
+    
+    winner_change = round(k_factor * (1 - expected_winner))
+    loser_change = round(k_factor * (0 - expected_loser))
+    return winner_change, loser_change
 
 
 # === MATCHES ===
 
 async def record_match(winner_id: int, loser_id: int):
-    """Возвращает (success, data). data = (new_w_elo, new_l_elo) или строка ошибки."""
+    """Возвращает (success, data). data = (new_w_elo, new_l_elo, w_change, l_change) или строка."""
     if winner_id == loser_id:
         return False, "Нельзя записать матч с самим собой"
 
@@ -157,9 +177,11 @@ async def record_match(winner_id: int, loser_id: int):
         if not winner_data or not loser_data:
             return False, "Один из игроков не найден в базе"
 
-        new_winner_elo, new_loser_elo = calculate_elo(
+        w_change, l_change = calculate_elo_change(
             winner_data['elo_rating'], loser_data['elo_rating']
         )
+        new_winner_elo = winner_data['elo_rating'] + w_change
+        new_loser_elo = loser_data['elo_rating'] + l_change
 
         async with conn.transaction():
             await conn.execute(
@@ -173,11 +195,40 @@ async def record_match(winner_id: int, loser_id: int):
                 new_loser_elo, loser_id
             )
             await conn.execute(
-                'INSERT INTO matches (winner_id, loser_id) VALUES ($1, $2)',
-                winner_id, loser_id
+                'INSERT INTO matches (winner_id, loser_id, winner_elo_change, loser_elo_change) '
+                'VALUES ($1, $2, $3, $4)',
+                winner_id, loser_id, w_change, l_change
             )
 
-        return True, (new_winner_elo, new_loser_elo)
+        return True, (new_winner_elo, new_loser_elo, w_change, l_change)
+
+
+async def get_match_history(telegram_id: int, limit: int = 10):
+    async with _pool.acquire() as conn:
+        return await conn.fetch('''
+            SELECT m.id, m.winner_id, m.loser_id, m.winner_elo_change, m.loser_elo_change, m.played_at,
+                   u1.full_name as winner_name, u1.username as winner_username,
+                   u2.full_name as loser_name, u2.username as loser_username
+            FROM matches m
+            JOIN users u1 ON m.winner_id = u1.telegram_id
+            JOIN users u2 ON m.loser_id = u2.telegram_id
+            WHERE m.winner_id = $1 OR m.loser_id = $1
+            ORDER BY m.played_at DESC
+            LIMIT $2
+        ''', telegram_id, limit)
+
+
+async def get_h2h_stats(user_id1: int, user_id2: int):
+    async with _pool.acquire() as conn:
+        w1 = await conn.fetchval(
+            'SELECT COUNT(*) FROM matches WHERE winner_id = $1 AND loser_id = $2',
+            user_id1, user_id2
+        )
+        w2 = await conn.fetchval(
+            'SELECT COUNT(*) FROM matches WHERE winner_id = $1 AND loser_id = $2',
+            user_id2, user_id1
+        )
+        return w1, w2
 
 
 # === RANK / TOP ===
