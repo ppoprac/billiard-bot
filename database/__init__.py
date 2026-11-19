@@ -31,6 +31,22 @@ from database.challenges import (
 )
 
 
+DISCIPLINES_SEED = [
+    ("free_pyramid", "Свободная пирамида"),
+    ("combined_pyramid", "Комбинированная пирамида"),
+    ("dynamic_pyramid", "Динамичная пирамида"),
+    ("classic_pyramid", "Классическая русская пирамида"),
+    ("pool_8", "Пул‑8"),
+    ("pool_9", "Пул‑9"),
+    ("pool_10", "Пул‑10"),
+    ("pool_14_1", "Пул‑14+1 (стрейт‑пул)"),
+    ("snooker_15", "Снукер (15 красных)"),
+    ("snooker_6", "Снукер (6 красных)"),
+    ("snooker_1", "Снукер (1 красный)"),
+    ("carom", "Карамболь"),
+]
+
+
 async def init_db():
     await init_pool()
     pool = get_pool()
@@ -75,4 +91,56 @@ async def init_db():
                 loser_id BIGINT NOT NULL,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
+        ''')
+
+        # ===== Этап 2: дисциплины =====
+
+        # Задача 2.1 — таблица disciplines
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS disciplines (
+                id SERIAL PRIMARY KEY,
+                slug TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                sort_order INTEGER DEFAULT 0
+            )
+        ''')
+
+        # Заполнение 12 дисциплин (идемпотентно)
+        for idx, (slug, name) in enumerate(DISCIPLINES_SEED, start=1):
+            await conn.execute(
+                '''
+                INSERT INTO disciplines (slug, name, sort_order)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (slug) DO UPDATE
+                    SET name = EXCLUDED.name,
+                        sort_order = EXCLUDED.sort_order
+                ''',
+                slug, name, idx
+            )
+
+        # Задача 2.2 — таблица user_ratings
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS user_ratings (
+                user_id BIGINT NOT NULL,
+                discipline_id INTEGER NOT NULL,
+                elo INTEGER DEFAULT 1000,
+                games_played INTEGER DEFAULT 0,
+                wins INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, discipline_id),
+                FOREIGN KEY (discipline_id) REFERENCES disciplines(id)
+            )
+        ''')
+
+        # Задача 2.3 — активная дисциплина у пользователя
+        await conn.execute('''
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS current_discipline_id INTEGER
+            REFERENCES disciplines(id) DEFAULT 1
+        ''')
+
+        # Задача 2.4 — дисциплина у матчей
+        await conn.execute('''
+            ALTER TABLE matches
+            ADD COLUMN IF NOT EXISTS discipline_id INTEGER
+            REFERENCES disciplines(id) DEFAULT 1
         ''')
