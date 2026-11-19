@@ -4,7 +4,6 @@ import logging
 from aiogram import Router, types, F, Bot
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 from config import ADMIN_ID
@@ -14,14 +13,11 @@ from database import (
     admin_ban_user,
     admin_delete_user,
 )
+from states import ReportStates
 from utils import display_name, is_admin
 
 
 router = Router()
-
-
-class ReportStates(StatesGroup):
-    waiting_for_reason = State()
 
 
 # ================== /report ==================
