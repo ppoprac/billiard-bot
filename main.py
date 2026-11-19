@@ -20,7 +20,6 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-
 dp.message.outer_middleware(BanCheckMiddleware())
 
 dp.include_router(common_router)
