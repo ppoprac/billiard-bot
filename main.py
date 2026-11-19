@@ -7,7 +7,7 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 
 from config import BOT_TOKEN, PORT, WEBHOOK_PATH, WEBHOOK_URL
 from database import init_db, close_pool, get_user_profile
-from handlers import common_router, rating_router, matches_router
+from handlers import common_router, rating_router, matches_router, challenges_router
 
 logging.basicConfig(level=logging.INFO)
 
@@ -38,6 +38,7 @@ dp.message.outer_middleware(BanCheckMiddleware())
 dp.include_router(common_router)
 dp.include_router(rating_router)
 dp.include_router(matches_router)
+dp.include_router(challenges_router)
 
 
 async def on_startup(bot: Bot):
