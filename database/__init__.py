@@ -99,8 +99,6 @@ async def init_db():
             )
         ''')
 
-        # ===== Этап 2: дисциплины =====
-
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS disciplines (
                 id SERIAL PRIMARY KEY,
