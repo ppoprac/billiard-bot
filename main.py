@@ -30,11 +30,11 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Машина состояний для жалоб
+
 class ReportStates(StatesGroup):
     waiting_for_reason = State()
 
-# Мидлварь для проверки бана
+
 class BanCheckMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -54,8 +54,10 @@ class BanCheckMiddleware(BaseMiddleware):
 
 dp.message.outer_middleware(BanCheckMiddleware())
 
+
 def display_name(row):
     return row['full_name'] or row['username'] or "Аноним"
+
 
 def is_admin(user_id: int) -> bool:
     if not ADMIN_ID: return False
@@ -72,9 +74,17 @@ def disciplines_keyboard(disciplines, prefix: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def send_welcome(message: types.Message, user):
+async def get_active_discipline(user):
+    """Возвращает (discipline_row, rating_row) для активной дисциплины, либо (None, None)."""
+    if not user or user['current_discipline_id'] is None:
+        return None, None
     discipline = await get_discipline_by_id(user['current_discipline_id'])
-    rating = await get_user_rating(user['telegram_id'], user['current_discipline_id'])
+    rating = await ensure_user_rating(user['telegram_id'], user['current_discipline_id'])
+    return discipline, rating
+
+
+async def send_welcome(message: types.Message, user):
+    discipline, rating = await get_active_discipline(user)
     elo = rating['elo'] if rating else 1000
     games = rating['games_played'] if rating else 0
     wins = rating['wins'] if rating else 0
@@ -124,7 +134,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
         return
 
-    # Подстраховка: если у пользователя ещё нет рейтинга в текущей дисциплине
     await ensure_user_rating(user['telegram_id'], user['current_discipline_id'])
     await send_welcome(message, user)
 
@@ -145,8 +154,6 @@ async def process_pick_discipline(callback: CallbackQuery):
     await ensure_user_rating(callback.from_user.id, discipline_id)
     await set_user_current_discipline(callback.from_user.id, discipline_id)
 
-    # Перечитываем профиль, чтобы отобразить актуальные данные
-    user = await get_user_profile(callback.from_user.id)
     rating = await get_user_rating(callback.from_user.id, discipline_id)
     elo = rating['elo'] if rating else 1000
 
@@ -252,8 +259,7 @@ async def cmd_profile(message: types.Message):
         await message.answer("Сначала выбери дисциплину через /discipline")
         return
 
-    discipline = await get_discipline_by_id(user['current_discipline_id'])
-    rating = await get_user_rating(message.from_user.id, user['current_discipline_id'])
+    discipline, rating = await get_active_discipline(user)
     elo = rating['elo'] if rating else 1000
     games = rating['games_played'] if rating else 0
     wins = rating['wins'] if rating else 0
@@ -366,25 +372,28 @@ async def cmd_top(message: types.Message):
     if not user:
         await message.answer("Сначала напиши /start")
         return
+    if user['current_discipline_id'] is None:
+        await message.answer("Сначала выбери дисциплину через /discipline")
+        return
 
-    total = await get_total_players()
+    discipline = await get_discipline_by_id(user['current_discipline_id'])
+    disc_id = user['current_discipline_id']
+
+    total = await get_total_players(disc_id)
     if total == 0:
-        await message.answer("Пока нет игроков в рейтинге")
+        await message.answer("Пока нет игроков в рейтинге этой дисциплины")
         return
 
     user_id = message.from_user.id
-    user_rank = await get_user_rank(user_id)
-    if user_rank is None:
-        await message.answer("Не могу определить твою позицию, попробуй позже")
-        return
+    user_rank = await get_user_rank(user_id, disc_id)
 
     if total <= 30 or user_rank <= 30:
         show_upto = min(30, total)
-        players = await get_players_upto(show_upto)
+        players = await get_players_upto(disc_id, show_upto)
         display_ranks = list(range(1, len(players) + 1))
     else:
         show_upto = min(user_rank + 5, total)
-        players = await get_players_upto(show_upto)
+        players = await get_players_upto(disc_id, show_upto)
         top_ranks = list(range(1, 11))
         above_from = max(11, user_rank - 10)
         above_to = user_rank - 1
@@ -393,7 +402,7 @@ async def cmd_top(message: types.Message):
         below_ranks = list(range(user_rank + 1, min(user_rank + 5, total) + 1))
         display_ranks = top_ranks + above_ranks + me_rank + below_ranks
 
-    text = "🏆 <b>Рейтинг игроков</b>\n\n"
+    text = f"🏆 <b>Рейтинг — {discipline['name'] if discipline else '—'}</b>\n\n"
     prev_rank = 0
     for rank in display_ranks:
         if rank > prev_rank + 1:
@@ -427,13 +436,19 @@ async def cmd_history(message: types.Message):
     if not user:
         await message.answer("Сначала напиши /start")
         return
-
-    matches = await get_match_history(message.from_user.id, limit=10)
-    if not matches:
-        await message.answer("📭 У тебя пока нет сыгранных матчей.")
+    if user['current_discipline_id'] is None:
+        await message.answer("Сначала выбери дисциплину через /discipline")
         return
 
-    text = "📜 <b>Твои последние матчи</b>\n\n"
+    disc_id = user['current_discipline_id']
+    discipline = await get_discipline_by_id(disc_id)
+
+    matches = await get_match_history(message.from_user.id, disc_id, limit=10)
+    if not matches:
+        await message.answer("📭 У тебя пока нет сыгранных матчей в этой дисциплине.")
+        return
+
+    text = f"📜 <b>Последние матчи — {discipline['name'] if discipline else '—'}</b>\n\n"
     for m in matches:
         date_str = m['played_at'].strftime('%d.%m %H:%M')
         if m['winner_id'] == message.from_user.id:
@@ -453,8 +468,12 @@ async def cmd_history(message: types.Message):
 
 @dp.message(Command("h2h"))
 async def cmd_h2h(message: types.Message):
-    if not await get_user_profile(message.from_user.id):
+    user = await get_user_profile(message.from_user.id)
+    if not user:
         await message.answer("Сначала напиши /start")
+        return
+    if user['current_discipline_id'] is None:
+        await message.answer("Сначала выбери дисциплину через /discipline")
         return
 
     players = await get_all_users(30)
@@ -470,7 +489,7 @@ async def cmd_h2h(message: types.Message):
         )] for p in players
     ])
     await message.answer(
-        "🆚 <b>С кем сравниваем?</b>\nВыбери соперника, чтобы увидеть статистику личных встреч.",
+        "🆚 <b>С кем сравниваем?</b>\nВыбери соперника, чтобы увидеть статистику личных встреч в текущей дисциплине.",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
@@ -486,20 +505,27 @@ async def process_h2h_select(callback: CallbackQuery):
     if not user or not opponent:
         await callback.answer("Игрок не найден", show_alert=True)
         return
+    if user['current_discipline_id'] is None:
+        await callback.answer("Сначала выбери дисциплину", show_alert=True)
+        return
 
-    wins, losses = await get_h2h_stats(user_id, opponent_id)
+    disc_id = user['current_discipline_id']
+    discipline = await get_discipline_by_id(disc_id)
+
+    wins, losses = await get_h2h_stats(user_id, opponent_id, disc_id)
     total = wins + losses
+    disc_name = discipline['name'] if discipline else "—"
 
     if total == 0:
         await callback.message.edit_text(
-            f"🆚 Статистика с <b>{display_name(opponent)}</b>:\n\n"
-            f"Вы ещё не играли друг с другом.",
+            f"🆚 Статистика с <b>{display_name(opponent)}</b> ({disc_name}):\n\n"
+            f"Вы ещё не играли друг с другом в этой дисциплине.",
             parse_mode="HTML"
         )
     else:
         winrate = (wins / total) * 100
         await callback.message.edit_text(
-            f"🆚 <b>Статистика с {display_name(opponent)}</b>\n\n"
+            f"🆚 <b>Статистика с {display_name(opponent)}</b> ({disc_name})\n\n"
             f"Всего матчей: {total}\n"
             f"🏆 Твоих побед: <b>{wins}</b>\n"
             f"📉 Твоих поражений: <b>{losses}</b>\n"
@@ -513,8 +539,12 @@ async def process_h2h_select(callback: CallbackQuery):
 
 @dp.message(Command("match"))
 async def cmd_match(message: types.Message):
-    if not await get_user_profile(message.from_user.id):
+    user = await get_user_profile(message.from_user.id)
+    if not user:
         await message.answer("Сначала напиши /start")
+        return
+    if user['current_discipline_id'] is None:
+        await message.answer("Сначала выбери дисциплину через /discipline")
         return
 
     players = await get_all_users(30)
@@ -562,11 +592,19 @@ async def process_select_opponent(callback: CallbackQuery):
 async def process_confirm_lose(callback: CallbackQuery):
     winner_id = int(callback.data.removeprefix("confirm_lose_"))
     loser_id = callback.from_user.id
-    success, data = await record_match(winner_id, loser_id)
+
+    user = await get_user_profile(loser_id)
+    if not user or user['current_discipline_id'] is None:
+        await callback.answer("Сначала выбери дисциплину", show_alert=True)
+        return
+    disc_id = user['current_discipline_id']
+    discipline = await get_discipline_by_id(disc_id)
+
+    success, data = await record_match(winner_id, loser_id, disc_id)
     if success:
         new_winner_elo, new_loser_elo, w_change, l_change = data
         await callback.message.edit_text(
-            f"✅ <b>Результат записан!</b>\n\n"
+            f"✅ <b>Результат записан ({discipline['name'] if discipline else '—'})!</b>\n\n"
             f"📉 Твой рейтинг: <b>{new_loser_elo}</b> ({l_change})\n"
             f"🏆 Рейтинг соперника: <b>{new_winner_elo}</b> (+{w_change})",
             parse_mode="HTML",
@@ -575,6 +613,7 @@ async def process_confirm_lose(callback: CallbackQuery):
             await bot.send_message(
                 winner_id,
                 f"🎉 Тебе записали победу!\n"
+                f"🎯 Дисциплина: <b>{discipline['name'] if discipline else '—'}</b>\n"
                 f"🏆 Твой новый рейтинг: <b>{new_winner_elo}</b> (+{w_change})",
                 parse_mode="HTML",
             )
@@ -589,9 +628,14 @@ async def process_confirm_lose(callback: CallbackQuery):
 
 @dp.message(Command("result"))
 async def cmd_result(message: types.Message):
-    if not await get_user_profile(message.from_user.id):
+    user = await get_user_profile(message.from_user.id)
+    if not user:
         await message.answer("Сначала напиши /start")
         return
+    if user['current_discipline_id'] is None:
+        await message.answer("Сначала выбери дисциплину через /discipline")
+        return
+
     players = await get_all_users(30)
     players = [p for p in players if p['telegram_id'] != message.from_user.id]
     if not players:
@@ -619,6 +663,10 @@ async def process_result_select(callback: CallbackQuery):
     if not winner or not loser:
         await callback.answer("Игрок не найден", show_alert=True)
         return
+    if winner['current_discipline_id'] is None:
+        await callback.answer("Сначала выбери дисциплину", show_alert=True)
+        return
+
     success, data = await create_pending_result(winner_id, loser_id)
     if not success:
         await callback.message.edit_text(f"❌ {data}")
@@ -669,12 +717,23 @@ async def process_result_confirm(callback: CallbackQuery):
     if callback.from_user.id != loser_id:
         await callback.answer("Это не твой запрос", show_alert=True)
         return
+
+    # Дисциплину берём у победителя (инициатора /result)
+    winner = await get_user_profile(winner_id)
+    if not winner or winner['current_discipline_id'] is None:
+        await delete_pending_result(pending_id)
+        await callback.message.edit_text("❌ У инициатора не выбрана дисциплина.")
+        await callback.answer()
+        return
+    disc_id = winner['current_discipline_id']
+    discipline = await get_discipline_by_id(disc_id)
+
     await delete_pending_result(pending_id)
-    success, data = await record_match(winner_id, loser_id)
+    success, data = await record_match(winner_id, loser_id, disc_id)
     if success:
         new_winner_elo, new_loser_elo, w_change, l_change = data
         await callback.message.edit_text(
-            f"✅ <b>Подтверждено!</b>\n\n"
+            f"✅ <b>Подтверждено ({discipline['name'] if discipline else '—'})!</b>\n\n"
             f"📉 Твой рейтинг: <b>{new_loser_elo}</b> ({l_change})",
             parse_mode="HTML",
         )
@@ -682,6 +741,7 @@ async def process_result_confirm(callback: CallbackQuery):
             await bot.send_message(
                 winner_id,
                 f"🎉 Соперник подтвердил твою победу!\n"
+                f"🎯 Дисциплина: <b>{discipline['name'] if discipline else '—'}</b>\n"
                 f"🏆 Твой новый рейтинг: <b>{new_winner_elo}</b> (+{w_change})",
                 parse_mode="HTML",
             )
@@ -720,10 +780,18 @@ async def process_result_decline(callback: CallbackQuery):
 
 @dp.message(Command("challenge"))
 async def cmd_challenge(message: types.Message):
-    if not await get_user_profile(message.from_user.id):
+    user = await get_user_profile(message.from_user.id)
+    if not user:
         await message.answer("Сначала напиши /start")
         return
-    available = await get_players_above(message.from_user.id)
+    if user['current_discipline_id'] is None:
+        await message.answer("Сначала выбери дисциплину через /discipline")
+        return
+
+    disc_id = user['current_discipline_id']
+    discipline = await get_discipline_by_id(disc_id)
+
+    available = await get_players_above(message.from_user.id, disc_id)
     if not available:
         await message.answer(
             "🚀 Некого вызывать: ты на вершине или пока мало игроков.\n"
@@ -737,7 +805,7 @@ async def cmd_challenge(message: types.Message):
         )] for rank, tid, uname, fname, elo in available
     ])
     await message.answer(
-        "⚔️ <b>Кого вызываешь?</b>\n"
+        f"⚔️ <b>Кого вызываешь?</b> ({discipline['name'] if discipline else '—'})\n"
         "Вызывать можно игроков выше тебя не более чем на 10 позиций.",
         reply_markup=keyboard,
         parse_mode="HTML",
