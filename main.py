@@ -20,15 +20,11 @@ from database import (
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-BASE_URL = os.getenv("RENDER_EXTERNAL_URL")
-ADMIN_ID = os.getenv("ADMIN_ID")
-if ADMIN_ID:
-    ADMIN_ID = ADMIN_ID.strip()
-
-PORT = int(os.getenv("PORT", 8080))
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
+from config import (
+    BOT_TOKEN, BASE_URL, ADMIN_ID, PORT,
+    WEBHOOK_PATH, WEBHOOK_URL,
+    K_FACTOR, MATCH_COOLDOWN_MINUTES, CHALLENGE_RANGE,
+)
 
 if not BOT_TOKEN:
     raise RuntimeError("Переменная BOT_TOKEN не установлена")
