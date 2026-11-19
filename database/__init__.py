@@ -30,6 +30,7 @@ from database.matches import (
 from database.challenges import (
     create_challenge,
     get_challenge,
+    get_active_challenges_for_user,
     update_challenge_status,
     create_pending_result,
     get_pending_result,
@@ -140,6 +141,18 @@ async def init_db():
 
         await conn.execute('''
             ALTER TABLE matches
+            ADD COLUMN IF NOT EXISTS discipline_id INTEGER
+            REFERENCES disciplines(id) DEFAULT 1
+        ''')
+
+        # Этап 3.5 — дисциплина у вызовов и pending_results
+        await conn.execute('''
+            ALTER TABLE challenges
+            ADD COLUMN IF NOT EXISTS discipline_id INTEGER
+            REFERENCES disciplines(id) DEFAULT 1
+        ''')
+        await conn.execute('''
+            ALTER TABLE pending_results
             ADD COLUMN IF NOT EXISTS discipline_id INTEGER
             REFERENCES disciplines(id) DEFAULT 1
         ''')
