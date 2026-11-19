@@ -604,4 +604,401 @@ async def cmd_result(message: types.Message):
         )] for p in players
     ])
     await message.answer(
-        "🏆 <
+        "🏆 <b>Выбери соперника, которого ты победил:</b>",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data.startswith("result_select_"))
+async def process_result_select(callback: CallbackQuery):
+    loser_id = int(callback.data.removeprefix("result_select_"))
+    winner_id = callback.from_user.id
+    winner = await get_user_profile(winner_id)
+    loser = await get_user_profile(loser_id)
+    if not winner or not loser:
+        await callback.answer("Игрок не найден", show_alert=True)
+        return
+    success, data = await create_pending_result(winner_id, loser_id)
+    if not success:
+        await callback.message.edit_text(f"❌ {data}")
+        await callback.answer()
+        return
+    pending_id = data
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✅ Подтвердить поражение",
+            callback_data=f"result_confirm_{pending_id}",
+        )],
+        [InlineKeyboardButton(
+            text="❌ Отклонить",
+            callback_data=f"result_decline_{pending_id}",
+        )],
+    ])
+    try:
+        await bot.send_message(
+            loser_id,
+            f"🎱 <b>{display_name(winner)}</b> записал победу над тобой.\n"
+            f"Подтверди, если это правда.",
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+    except Exception:
+        await callback.message.edit_text(
+            "❌ Не удалось отправить запрос сопернику (возможно, заблокировал бота)."
+        )
+        await delete_pending_result(pending_id)
+        await callback.answer()
+        return
+    await callback.message.edit_text(
+        f"✅ Запрос отправлен игроку {display_name(loser)}. Ждём подтверждения."
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("result_confirm_"))
+async def process_result_confirm(callback: CallbackQuery):
+    pending_id = int(callback.data.removeprefix("result_confirm_"))
+    pending = await get_pending_result(pending_id)
+    if not pending:
+        await callback.message.edit_text("❌ Запрос устарел или уже обработан.")
+        await callback.answer()
+        return
+    winner_id = pending['winner_id']
+    loser_id = pending['loser_id']
+    if callback.from_user.id != loser_id:
+        await callback.answer("Это не твой запрос", show_alert=True)
+        return
+    await delete_pending_result(pending_id)
+    success, data = await record_match(winner_id, loser_id)
+    if success:
+        new_winner_elo, new_loser_elo, w_change, l_change = data
+        await callback.message.edit_text(
+            f"✅ <b>Подтверждено!</b>\n\n"
+            f"📉 Твой рейтинг: <b>{new_loser_elo}</b> ({l_change})",
+            parse_mode="HTML",
+        )
+        try:
+            await bot.send_message(
+                winner_id,
+                f"🎉 Соперник подтвердил твою победу!\n"
+                f"🏆 Твой новый рейтинг: <b>{new_winner_elo}</b> (+{w_change})",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    else:
+        await callback.message.edit_text(f"❌ {data}")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("result_decline_"))
+async def process_result_decline(callback: CallbackQuery):
+    pending_id = int(callback.data.removeprefix("result_decline_"))
+    pending = await get_pending_result(pending_id)
+    if not pending:
+        await callback.message.edit_text("❌ Запрос устарел.")
+        await callback.answer()
+        return
+    winner_id = pending['winner_id']
+    loser_id = pending['loser_id']
+    if callback.from_user.id != loser_id:
+        await callback.answer("Это не твой запрос", show_alert=True)
+        return
+    await delete_pending_result(pending_id)
+    await callback.message.edit_text("❌ Ты отклонил запрос. Результат не записан.")
+    try:
+        await bot.send_message(
+            winner_id, "❌ Соперник отклонил запрос на победу."
+        )
+    except Exception:
+        pass
+    await callback.answer()
+
+
+# ================== /challenge ==================
+
+@dp.message(Command("challenge"))
+async def cmd_challenge(message: types.Message):
+    if not await get_user_profile(message.from_user.id):
+        await message.answer("Сначала напиши /start")
+        return
+    available = await get_players_above(message.from_user.id)
+    if not available:
+        await message.answer(
+            "🚀 Некого вызывать: ты на вершине или пока мало игроков.\n"
+            "Смотри /top"
+        )
+        return
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"#{rank} {fname or uname or 'Аноним'} ({elo} ELO)",
+            callback_data=f"challenge_select_{tid}",
+        )] for rank, tid, uname, fname, elo in available
+    ])
+    await message.answer(
+        "⚔️ <b>Кого вызываешь?</b>\n"
+        "Вызывать можно игроков выше тебя не более чем на 10 позиций.",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data.startswith("challenge_select_"))
+async def process_challenge_select(callback: CallbackQuery):
+    opponent_id = int(callback.data.removeprefix("challenge_select_"))
+    challenger_id = callback.from_user.id
+    challenger = await get_user_profile(challenger_id)
+    opponent = await get_user_profile(opponent_id)
+    if not challenger or not opponent:
+        await callback.answer("Игрок не найден", show_alert=True)
+        return
+    success, data = await create_challenge(challenger_id, opponent_id)
+    if not success:
+        await callback.message.edit_text(f"❌ {data}")
+        await callback.answer()
+        return
+    challenge_id = data
+
+    keyboard_opponent = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Принять", callback_data=f"challenge_accept_{challenge_id}")],
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"challenge_decline_{challenge_id}")],
+    ])
+
+    keyboard_cancel = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить вызов", callback_data=f"challenge_cancel_{challenge_id}")]
+    ])
+
+    try:
+        await bot.send_message(
+            opponent_id,
+            f"⚔️ <b>{display_name(challenger)}</b> вызывает тебя на матч!\n"
+            f"Рейтинг вызывающего: <b>{challenger['elo_rating']}</b> ELO",
+            reply_markup=keyboard_opponent,
+            parse_mode="HTML",
+        )
+    except Exception:
+        await callback.message.edit_text("❌ Не удалось отправить вызов (возможно, соперник заблокировал бота).")
+        await update_challenge_status(challenge_id, "failed")
+        await callback.answer()
+        return
+    await callback.message.edit_text(
+        f"✅ Вызов отправлен игроку {display_name(opponent)}. Ждём ответа.",
+        reply_markup=keyboard_cancel
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("challenge_accept_"))
+async def process_challenge_accept(callback: CallbackQuery):
+    challenge_id = int(callback.data.removeprefix("challenge_accept_"))
+    challenge = await get_challenge(challenge_id)
+    if not challenge or challenge['status'] != "pending":
+        await callback.message.edit_text("❌ Вызов устарел или уже обработан.")
+        await callback.answer()
+        return
+    challenger_id = challenge['challenger_id']
+    opponent_id = challenge['opponent_id']
+    if callback.from_user.id != opponent_id:
+        await callback.answer("Это не твой вызов", show_alert=True)
+        return
+    await update_challenge_status(challenge_id, "accepted")
+
+    keyboard_cancel = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить матч", callback_data=f"challenge_cancel_{challenge_id}")]
+    ])
+
+    await callback.message.edit_text(
+        "✅ <b>Вызов принят!</b>\n\nСыграйте матч, затем введите результат:\n• Победитель → /result\n• Проигравший → /match",
+        reply_markup=keyboard_cancel,
+        parse_mode="HTML",
+    )
+    try:
+        opponent = await get_user_profile(opponent_id)
+        await bot.send_message(
+            challenger_id,
+            f"🎉 {display_name(opponent)} принял твой вызов!\nПосле игры введите результат через /result или /match.",
+            reply_markup=keyboard_cancel,
+        )
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("challenge_decline_"))
+async def process_challenge_decline(callback: CallbackQuery):
+    challenge_id = int(callback.data.removeprefix("challenge_decline_"))
+    challenge = await get_challenge(challenge_id)
+    if not challenge or challenge['status'] != "pending":
+        await callback.message.edit_text("❌ Вызов устарел или уже обработан.")
+        await callback.answer()
+        return
+    challenger_id = challenge['challenger_id']
+    opponent_id = challenge['opponent_id']
+    if callback.from_user.id != opponent_id:
+        await callback.answer("Это не твой вызов", show_alert=True)
+        return
+    await update_challenge_status(challenge_id, "declined")
+    await callback.message.edit_text("❌ Ты отклонил вызов.")
+    try:
+        opponent = await get_user_profile(opponent_id)
+        await bot.send_message(challenger_id, f"❌ {display_name(opponent)} отклонил твой вызов.")
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("challenge_cancel_"))
+async def process_challenge_cancel(callback: CallbackQuery):
+    challenge_id = int(callback.data.removeprefix("challenge_cancel_"))
+    challenge = await get_challenge(challenge_id)
+
+    if not challenge or challenge['status'] not in ('pending', 'accepted'):
+        await callback.message.edit_text("❌ Этот вызов уже обработан, завершен или отменен.")
+        await callback.answer()
+        return
+
+    challenger_id = challenge['challenger_id']
+    opponent_id = challenge['opponent_id']
+
+    if callback.from_user.id not in (challenger_id, opponent_id):
+        await callback.answer("Это не твой вызов", show_alert=True)
+        return
+
+    await update_challenge_status(challenge_id, "cancelled")
+    await callback.message.edit_text("❌ Вы отменили вызов/матч.")
+
+    other_id = opponent_id if callback.from_user.id == challenger_id else challenger_id
+    try:
+        canceller = await get_user_profile(callback.from_user.id)
+        await bot.send_message(other_id, f"❌ {display_name(canceller)} отменил вызов/матч.")
+    except Exception:
+        pass
+
+    await callback.answer()
+
+
+# ================== АДМИН-КОМАНДЫ ==================
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(
+        "👑 <b>Админ-панель</b>\n\n"
+        "Чтобы забанить или удалить игрока, отправьте команду:\n"
+        "<code>/ban 123456789</code>\n"
+        "<code>/unban 123456789</code>\n"
+        "<code>/delete_user 123456789</code>\n\n"
+        "Или просто <b>перешлите сообщение</b> от нарушителя боту с подписью <code>/ban</code> в ответ.",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: types.Message):
+    if not is_admin(message.from_user.id): return
+    target_id = None
+
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    elif len(message.text.split()) > 1:
+        try:
+            target_id = int(message.text.split()[1])
+        except ValueError:
+            pass
+
+    if not target_id:
+        await message.answer("Укажите ID игрока или ответьте на его сообщение.")
+        return
+
+    success = await admin_ban_user(target_id, True)
+    if success:
+        await message.answer(f"✅ Игрок {target_id} забанен. Он скрыт из топов и не может играть.")
+        try:
+            await bot.send_message(target_id, "🚫 Вы были заблокированы администратором за нарушение правил.")
+        except Exception:
+            pass
+    else:
+        await message.answer("❌ Игрок с таким ID не найден.")
+
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: types.Message):
+    if not is_admin(message.from_user.id): return
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    elif len(message.text.split()) > 1:
+        try:
+            target_id = int(message.text.split()[1])
+        except ValueError:
+            pass
+
+    if not target_id:
+        await message.answer("Укажите ID игрока или ответьте на его сообщение.")
+        return
+
+    success = await admin_ban_user(target_id, False)
+    if success:
+        await message.answer(f"✅ Игрок {target_id} разбанен.")
+    else:
+        await message.answer("❌ Игрок с таким ID не найден.")
+
+
+@dp.message(Command("delete_user"))
+async def cmd_delete_user(message: types.Message):
+    if not is_admin(message.from_user.id): return
+    target_id = None
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    elif len(message.text.split()) > 1:
+        try:
+            target_id = int(message.text.split()[1])
+        except ValueError:
+            pass
+
+    if not target_id:
+        await message.answer("Укажите ID игрока или ответьте на его сообщение.")
+        return
+
+    success = await admin_delete_user(target_id)
+    if success:
+        await message.answer(f"🗑 Игрок {target_id} полностью удален. Его история матчей сохранена как 'Удаленный игрок'.")
+    else:
+        await message.answer("❌ Игрок с таким ID не найден.")
+
+
+# ================== Webhook ==================
+
+async def on_startup(bot: Bot):
+    await init_db()
+    logging.info("База данных инициализирована")
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    logging.info(f"Webhook установлен: {WEBHOOK_URL}")
+
+
+async def on_shutdown(bot: Bot):
+    logging.info("Закрываем пул соединений с БД...")
+    await close_pool()
+
+
+async def healthcheck(request: web.Request):
+    return web.Response(text="OK")
+
+
+def main():
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+
+    app = web.Application()
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+    app.router.add_get("/", healthcheck)
+    app.router.add_get("/healthcheck", healthcheck)
+    setup_application(app, dp, bot=bot)
+    logging.info(f"Запуск web-сервера на 0.0.0.0:{PORT}")
+    web.run_app(app, host="0.0.0.0", port=PORT)
+
+
+if __name__ == "__main__":
+    main()
