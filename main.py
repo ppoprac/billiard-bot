@@ -10,24 +10,22 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
+from config import (
+    BOT_TOKEN, BASE_URL, ADMIN_ID, PORT,
+    WEBHOOK_PATH, WEBHOOK_URL,
+    K_FACTOR, MATCH_COOLDOWN_MINUTES, CHALLENGE_RANGE,
+)
 from database import (
     init_db, close_pool, get_or_create_user, get_user_profile, get_all_users,
     get_players_above, get_total_players, get_user_rank, get_players_upto,
     record_match, get_match_history, get_h2h_stats, create_challenge, get_challenge,
     update_challenge_status, create_pending_result, get_pending_result,
     delete_pending_result, admin_ban_user, admin_delete_user,
+    get_all_disciplines, get_discipline_by_id, set_user_current_discipline,
+    ensure_user_rating, get_user_rating,
 )
 
 logging.basicConfig(level=logging.INFO)
-
-from config import (
-    BOT_TOKEN, BASE_URL, ADMIN_ID, PORT,
-    WEBHOOK_PATH, WEBHOOK_URL,
-    K_FACTOR, MATCH_COOLDOWN_MINUTES, CHALLENGE_RANGE,
-)
-
-if not BOT_TOKEN:
-    raise RuntimeError("Переменная BOT_TOKEN не установлена")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -44,18 +42,16 @@ class BanCheckMiddleware(BaseMiddleware):
         event: types.Message,
         data: Dict[str, Any]
     ) -> Any:
-        # Пропускаем /start, чтобы человек увидел, что он забанен
         if event.text and event.text.startswith("/start"):
             return await handler(event, data)
-            
+
         user = await get_user_profile(event.from_user.id)
         if user and user['is_banned']:
             await event.answer("🚫 Вы заблокированы. Доступ к командам закрыт.")
-            return # Прерываем обработку
-            
+            return
+
         return await handler(event, data)
 
-# Подключаем мидлварь
 dp.message.outer_middleware(BanCheckMiddleware())
 
 def display_name(row):
@@ -64,6 +60,45 @@ def display_name(row):
 def is_admin(user_id: int) -> bool:
     if not ADMIN_ID: return False
     return str(user_id) == str(ADMIN_ID)
+
+
+def disciplines_keyboard(disciplines, prefix: str) -> InlineKeyboardMarkup:
+    rows = []
+    for d in disciplines:
+        rows.append([InlineKeyboardButton(
+            text=d['name'],
+            callback_data=f"{prefix}_{d['id']}",
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_welcome(message: types.Message, user):
+    discipline = await get_discipline_by_id(user['current_discipline_id'])
+    rating = await get_user_rating(user['telegram_id'], user['current_discipline_id'])
+    elo = rating['elo'] if rating else 1000
+    games = rating['games_played'] if rating else 0
+    wins = rating['wins'] if rating else 0
+    disc_name = discipline['name'] if discipline else "—"
+
+    await message.answer(
+        f"Привет, {user['full_name']}! 🎱\n\n"
+        f"🎯 Дисциплина: <b>{disc_name}</b>\n"
+        f"📊 Твой рейтинг: <b>{elo}</b> ELO\n"
+        f"🎮 Игр: {games} | 🏆 Побед: {wins}\n\n"
+        f"👇 Команды:\n"
+        f"/match — Записать поражение\n"
+        f"/result — Записать победу\n"
+        f"/challenge — Вызвать соперника\n"
+        f"/top — Таблица рейтинга\n"
+        f"/profile — Твоя статистика\n"
+        f"/history — История матчей\n"
+        f"/h2h — Личные встречи\n"
+        f"/discipline — Сменить дисциплину\n"
+        f"/report — Пожаловаться на игрока\n"
+        f"/help — Все команды",
+        parse_mode="HTML",
+    )
+
 
 # ================== БАЗОВЫЕ КОМАНДЫ ==================
 
@@ -79,22 +114,50 @@ async def cmd_start(message: types.Message, state: FSMContext):
         await message.answer("🚫 Вы заблокированы в этом боте.")
         return
 
-    await message.answer(
-        f"Привет, {message.from_user.full_name}! 🎱\n\n"
-        f"📊 Твой рейтинг: <b>{user['elo_rating']}</b> ELO\n"
-        f"🎮 Игр: {user['games_played']} | 🏆 Побед: {user['wins']}\n\n"
-        f"👇 Команды:\n"
-        f"/match — Записать поражение\n"
-        f"/result — Записать победу\n"
-        f"/challenge — Вызвать соперника\n"
-        f"/top — Таблица рейтинга\n"
-        f"/profile — Твоя статистика\n"
-        f"/history — История матчей\n"
-        f"/h2h — Личные встречи\n"
-        f"/report — Пожаловаться на игрока\n"
-        f"/help — Все команды",
+    if user['current_discipline_id'] is None:
+        disciplines = await get_all_disciplines()
+        await message.answer(
+            "👋 Добро пожаловать!\n\n"
+            "Перед началом выбери дисциплину, в которой будешь играть.\n"
+            "Позже её можно сменить командой /discipline.",
+            reply_markup=disciplines_keyboard(disciplines, "pick_disc"),
+        )
+        return
+
+    # Подстраховка: если у пользователя ещё нет рейтинга в текущей дисциплине
+    await ensure_user_rating(user['telegram_id'], user['current_discipline_id'])
+    await send_welcome(message, user)
+
+
+@dp.callback_query(F.data.startswith("pick_disc_"))
+async def process_pick_discipline(callback: CallbackQuery):
+    discipline_id = int(callback.data.removeprefix("pick_disc_"))
+    discipline = await get_discipline_by_id(discipline_id)
+    if not discipline:
+        await callback.answer("Дисциплина не найдена", show_alert=True)
+        return
+
+    user = await get_user_profile(callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала напиши /start", show_alert=True)
+        return
+
+    await ensure_user_rating(callback.from_user.id, discipline_id)
+    await set_user_current_discipline(callback.from_user.id, discipline_id)
+
+    # Перечитываем профиль, чтобы отобразить актуальные данные
+    user = await get_user_profile(callback.from_user.id)
+    rating = await get_user_rating(callback.from_user.id, discipline_id)
+    elo = rating['elo'] if rating else 1000
+
+    await callback.message.edit_text(
+        f"✅ Дисциплина выбрана: <b>{discipline['name']}</b>\n\n"
+        f"📊 Твой рейтинг: <b>{elo}</b> ELO\n\n"
+        f"Можешь начинать! Список команд — /help",
         parse_mode="HTML",
     )
+    await callback.answer()
+
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
@@ -108,9 +171,11 @@ async def cmd_help(message: types.Message):
         "/challenge — Вызвать игрока (до 10 позиций)\n"
         "/history — Твои последние 10 матчей\n"
         "/h2h — Статистика личных встреч\n"
+        "/discipline — Сменить дисциплину\n"
         "/report — Пожаловаться на нарушителя",
         parse_mode="HTML",
     )
+
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
@@ -120,6 +185,61 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("❌ Действие отменено.")
 
+
+# ================== /discipline ==================
+
+@dp.message(Command("discipline"))
+async def cmd_discipline(message: types.Message):
+    user = await get_user_profile(message.from_user.id)
+    if not user:
+        await message.answer("Сначала напиши /start")
+        return
+
+    if user['current_discipline_id'] is None:
+        disciplines = await get_all_disciplines()
+        await message.answer(
+            "Перед началом выбери дисциплину:",
+            reply_markup=disciplines_keyboard(disciplines, "pick_disc"),
+        )
+        return
+
+    current = await get_discipline_by_id(user['current_discipline_id'])
+    disciplines = await get_all_disciplines()
+    await message.answer(
+        f"🎯 Текущая дисциплина: <b>{current['name'] if current else '—'}</b>\n\n"
+        f"Выбери новую:",
+        reply_markup=disciplines_keyboard(disciplines, "switch_disc"),
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data.startswith("switch_disc_"))
+async def process_switch_discipline(callback: CallbackQuery):
+    discipline_id = int(callback.data.removeprefix("switch_disc_"))
+    discipline = await get_discipline_by_id(discipline_id)
+    if not discipline:
+        await callback.answer("Дисциплина не найдена", show_alert=True)
+        return
+
+    user = await get_user_profile(callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала напиши /start", show_alert=True)
+        return
+
+    await ensure_user_rating(callback.from_user.id, discipline_id)
+    await set_user_current_discipline(callback.from_user.id, discipline_id)
+
+    rating = await get_user_rating(callback.from_user.id, discipline_id)
+    elo = rating['elo'] if rating else 1000
+
+    await callback.message.edit_text(
+        f"✅ Дисциплина переключена: <b>{discipline['name']}</b>\n\n"
+        f"📊 Твой рейтинг здесь: <b>{elo}</b> ELO",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
 # ================== /profile ==================
 
 @dp.message(Command("profile"))
@@ -128,17 +248,29 @@ async def cmd_profile(message: types.Message):
     if not user:
         await message.answer("Сначала напиши /start")
         return
-    winrate = (user['wins'] / user['games_played'] * 100) if user['games_played'] > 0 else 0
+    if user['current_discipline_id'] is None:
+        await message.answer("Сначала выбери дисциплину через /discipline")
+        return
+
+    discipline = await get_discipline_by_id(user['current_discipline_id'])
+    rating = await get_user_rating(message.from_user.id, user['current_discipline_id'])
+    elo = rating['elo'] if rating else 1000
+    games = rating['games_played'] if rating else 0
+    wins = rating['wins'] if rating else 0
+    winrate = (wins / games * 100) if games > 0 else 0
+
     await message.answer(
         f"📊 <b>Твой профиль</b>\n\n"
         f"👤 Имя: {user['full_name']}\n"
-        f"📈 Рейтинг ELO: <b>{user['elo_rating']}</b>\n"
-        f"🎮 Сыграно игр: {user['games_played']}\n"
-        f"🏆 Побед: {user['wins']}\n"
+        f"🎯 Дисциплина: <b>{discipline['name'] if discipline else '—'}</b>\n"
+        f"📈 Рейтинг ELO: <b>{elo}</b>\n"
+        f"🎮 Сыграно игр: {games}\n"
+        f"🏆 Побед: {wins}\n"
         f"📉 Процент побед: {winrate:.1f}%\n"
         f"📅 Регистрация: {user['created_at'].strftime('%d.%m.%Y')}",
         parse_mode="HTML",
     )
+
 
 # ================== СИСТЕМА ЖАЛОБ ==================
 
@@ -166,17 +298,18 @@ async def cmd_report(message: types.Message, state: FSMContext):
         parse_mode="HTML",
     )
 
+
 @dp.callback_query(F.data.startswith("report_target_"))
 async def process_report_target(callback: CallbackQuery, state: FSMContext):
     target_id = int(callback.data.removeprefix("report_target_"))
-    
+
     if target_id == callback.from_user.id:
         await callback.answer("На себя жаловаться нельзя.", show_alert=True)
         return
-        
+
     await state.update_data(target_id=target_id)
     await state.set_state(ReportStates.waiting_for_reason)
-    
+
     await callback.message.edit_text(
         "📝 <b>Опиши причину жалобы</b> одним сообщением.\n\n"
         "Например: <i>«Оскорблял в личных сообщениях»</i> или <i>«Отказывается записывать результат»</i>.\n\n"
@@ -185,28 +318,29 @@ async def process_report_target(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
+
 @dp.message(ReportStates.waiting_for_reason)
 async def process_report_reason(message: types.Message, state: FSMContext):
     if not message.text:
         await message.answer("Пожалуйста, отправь текстовое сообщение с причиной.")
         return
-        
+
     data = await state.get_data()
     target_id = data.get("target_id")
     reason = message.text
-    
+
     await state.clear()
-    
+
     if not ADMIN_ID:
         await message.answer("❌ Ошибка: администратор не настроил систему жалоб (нет ADMIN_ID).")
         return
-        
+
     target = await get_user_profile(target_id)
     target_name = display_name(target) if target else f"ID {target_id}"
-    
+
     reporter = await get_user_profile(message.from_user.id)
     reporter_name = display_name(reporter)
-    
+
     admin_text = (
         f"🚨 <b>НОВАЯ ЖАЛОБА</b>\n\n"
         f"👤 <b>От кого:</b> {reporter_name} (ID: <code>{message.from_user.id}</code>)\n"
@@ -215,13 +349,14 @@ async def process_report_reason(message: types.Message, state: FSMContext):
         f"<i>Чтобы забанить нарушителя, отправь:</i>\n"
         f"<code>/ban {target_id}</code>"
     )
-    
+
     try:
         await bot.send_message(ADMIN_ID, admin_text, parse_mode="HTML")
         await message.answer("✅ Жалоба отправлена администратору. Спасибо за бдительность!")
     except Exception as e:
         logging.error(f"Не удалось отправить жалобу админу: {e}")
         await message.answer("❌ Не удалось отправить жалобу. Возможно, админ заблокировал бота.")
+
 
 # ================== /top ==================
 
@@ -469,393 +604,4 @@ async def cmd_result(message: types.Message):
         )] for p in players
     ])
     await message.answer(
-        "🏆 <b>Выбери соперника, которого ты победил:</b>",
-        reply_markup=keyboard,
-        parse_mode="HTML",
-    )
-
-
-@dp.callback_query(F.data.startswith("result_select_"))
-async def process_result_select(callback: CallbackQuery):
-    loser_id = int(callback.data.removeprefix("result_select_"))
-    winner_id = callback.from_user.id
-    winner = await get_user_profile(winner_id)
-    loser = await get_user_profile(loser_id)
-    if not winner or not loser:
-        await callback.answer("Игрок не найден", show_alert=True)
-        return
-    success, data = await create_pending_result(winner_id, loser_id)
-    if not success:
-        await callback.message.edit_text(f"❌ {data}")
-        await callback.answer()
-        return
-    pending_id = data
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="✅ Подтвердить поражение",
-            callback_data=f"result_confirm_{pending_id}",
-        )],
-        [InlineKeyboardButton(
-            text="❌ Отклонить",
-            callback_data=f"result_decline_{pending_id}",
-        )],
-    ])
-    try:
-        await bot.send_message(
-            loser_id,
-            f"🎱 <b>{display_name(winner)}</b> записал победу над тобой.\n"
-            f"Подтверди, если это правда.",
-            reply_markup=keyboard,
-            parse_mode="HTML",
-        )
-    except Exception:
-        await callback.message.edit_text(
-            "❌ Не удалось отправить запрос сопернику (возможно, заблокировал бота)."
-        )
-        await delete_pending_result(pending_id)
-        await callback.answer()
-        return
-    await callback.message.edit_text(
-        f"✅ Запрос отправлен игроку {display_name(loser)}. Ждём подтверждения."
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("result_confirm_"))
-async def process_result_confirm(callback: CallbackQuery):
-    pending_id = int(callback.data.removeprefix("result_confirm_"))
-    pending = await get_pending_result(pending_id)
-    if not pending:
-        await callback.message.edit_text("❌ Запрос устарел или уже обработан.")
-        await callback.answer()
-        return
-    winner_id = pending['winner_id']
-    loser_id = pending['loser_id']
-    if callback.from_user.id != loser_id:
-        await callback.answer("Это не твой запрос", show_alert=True)
-        return
-    await delete_pending_result(pending_id)
-    success, data = await record_match(winner_id, loser_id)
-    if success:
-        new_winner_elo, new_loser_elo, w_change, l_change = data
-        await callback.message.edit_text(
-            f"✅ <b>Подтверждено!</b>\n\n"
-            f"📉 Твой рейтинг: <b>{new_loser_elo}</b> ({l_change})",
-            parse_mode="HTML",
-        )
-        try:
-            await bot.send_message(
-                winner_id,
-                f"🎉 Соперник подтвердил твою победу!\n"
-                f"🏆 Твой новый рейтинг: <b>{new_winner_elo}</b> (+{w_change})",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-    else:
-        await callback.message.edit_text(f"❌ {data}")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("result_decline_"))
-async def process_result_decline(callback: CallbackQuery):
-    pending_id = int(callback.data.removeprefix("result_decline_"))
-    pending = await get_pending_result(pending_id)
-    if not pending:
-        await callback.message.edit_text("❌ Запрос устарел.")
-        await callback.answer()
-        return
-    winner_id = pending['winner_id']
-    loser_id = pending['loser_id']
-    if callback.from_user.id != loser_id:
-        await callback.answer("Это не твой запрос", show_alert=True)
-        return
-    await delete_pending_result(pending_id)
-    await callback.message.edit_text("❌ Ты отклонил запрос. Результат не записан.")
-    try:
-        await bot.send_message(
-            winner_id, "❌ Соперник отклонил запрос на победу."
-        )
-    except Exception:
-        pass
-    await callback.answer()
-
-
-# ================== /challenge ==================
-
-@dp.message(Command("challenge"))
-async def cmd_challenge(message: types.Message):
-    if not await get_user_profile(message.from_user.id):
-        await message.answer("Сначала напиши /start")
-        return
-    available = await get_players_above(message.from_user.id)
-    if not available:
-        await message.answer(
-            "🚀 Некого вызывать: ты на вершине или пока мало игроков.\n"
-            "Смотри /top"
-        )
-        return
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"#{rank} {fname or uname or 'Аноним'} ({elo} ELO)",
-            callback_data=f"challenge_select_{tid}",
-        )] for rank, tid, uname, fname, elo in available
-    ])
-    await message.answer(
-        "⚔️ <b>Кого вызываешь?</b>\n"
-        "Вызывать можно игроков выше тебя не более чем на 10 позиций.",
-        reply_markup=keyboard,
-        parse_mode="HTML",
-    )
-
-
-@dp.callback_query(F.data.startswith("challenge_select_"))
-async def process_challenge_select(callback: CallbackQuery):
-    opponent_id = int(callback.data.removeprefix("challenge_select_"))
-    challenger_id = callback.from_user.id
-    challenger = await get_user_profile(challenger_id)
-    opponent = await get_user_profile(opponent_id)
-    if not challenger or not opponent:
-        await callback.answer("Игрок не найден", show_alert=True)
-        return
-    success, data = await create_challenge(challenger_id, opponent_id)
-    if not success:
-        await callback.message.edit_text(f"❌ {data}")
-        await callback.answer()
-        return
-    challenge_id = data
-    
-    keyboard_opponent = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Принять", callback_data=f"challenge_accept_{challenge_id}")],
-        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"challenge_decline_{challenge_id}")],
-    ])
-    
-    keyboard_cancel = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отменить вызов", callback_data=f"challenge_cancel_{challenge_id}")]
-    ])
-
-    try:
-        await bot.send_message(
-            opponent_id,
-            f"⚔️ <b>{display_name(challenger)}</b> вызывает тебя на матч!\n"
-            f"Рейтинг вызывающего: <b>{challenger['elo_rating']}</b> ELO",
-            reply_markup=keyboard_opponent,
-            parse_mode="HTML",
-        )
-    except Exception:
-        await callback.message.edit_text("❌ Не удалось отправить вызов (возможно, соперник заблокировал бота).")
-        await update_challenge_status(challenge_id, "failed")
-        await callback.answer()
-        return
-    await callback.message.edit_text(
-        f"✅ Вызов отправлен игроку {display_name(opponent)}. Ждём ответа.",
-        reply_markup=keyboard_cancel
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("challenge_accept_"))
-async def process_challenge_accept(callback: CallbackQuery):
-    challenge_id = int(callback.data.removeprefix("challenge_accept_"))
-    challenge = await get_challenge(challenge_id)
-    if not challenge or challenge['status'] != "pending":
-        await callback.message.edit_text("❌ Вызов устарел или уже обработан.")
-        await callback.answer()
-        return
-    challenger_id = challenge['challenger_id']
-    opponent_id = challenge['opponent_id']
-    if callback.from_user.id != opponent_id:
-        await callback.answer("Это не твой вызов", show_alert=True)
-        return
-    await update_challenge_status(challenge_id, "accepted")
-    
-    keyboard_cancel = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отменить матч", callback_data=f"challenge_cancel_{challenge_id}")]
-    ])
-    
-    await callback.message.edit_text(
-        "✅ <b>Вызов принят!</b>\n\nСыграйте матч, затем введите результат:\n• Победитель → /result\n• Проигравший → /match",
-        reply_markup=keyboard_cancel,
-        parse_mode="HTML",
-    )
-    try:
-        opponent = await get_user_profile(opponent_id)
-        await bot.send_message(
-            challenger_id,
-            f"🎉 {display_name(opponent)} принял твой вызов!\nПосле игры введите результат через /result или /match.",
-            reply_markup=keyboard_cancel,
-        )
-    except Exception:
-        pass
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("challenge_decline_"))
-async def process_challenge_decline(callback: CallbackQuery):
-    challenge_id = int(callback.data.removeprefix("challenge_decline_"))
-    challenge = await get_challenge(challenge_id)
-    if not challenge or challenge['status'] != "pending":
-        await callback.message.edit_text("❌ Вызов устарел или уже обработан.")
-        await callback.answer()
-        return
-    challenger_id = challenge['challenger_id']
-    opponent_id = challenge['opponent_id']
-    if callback.from_user.id != opponent_id:
-        await callback.answer("Это не твой вызов", show_alert=True)
-        return
-    await update_challenge_status(challenge_id, "declined")
-    await callback.message.edit_text("❌ Ты отклонил вызов.")
-    try:
-        opponent = await get_user_profile(opponent_id)
-        await bot.send_message(challenger_id, f"❌ {display_name(opponent)} отклонил твой вызов.")
-    except Exception:
-        pass
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("challenge_cancel_"))
-async def process_challenge_cancel(callback: CallbackQuery):
-    challenge_id = int(callback.data.removeprefix("challenge_cancel_"))
-    challenge = await get_challenge(challenge_id)
-    
-    if not challenge or challenge['status'] not in ('pending', 'accepted'):
-        await callback.message.edit_text("❌ Этот вызов уже обработан, завершен или отменен.")
-        await callback.answer()
-        return
-        
-    challenger_id = challenge['challenger_id']
-    opponent_id = challenge['opponent_id']
-    
-    if callback.from_user.id not in (challenger_id, opponent_id):
-        await callback.answer("Это не твой вызов", show_alert=True)
-        return
-        
-    await update_challenge_status(challenge_id, "cancelled")
-    await callback.message.edit_text("❌ Вы отменили вызов/матч.")
-    
-    other_id = opponent_id if callback.from_user.id == challenger_id else challenger_id
-    try:
-        canceller = await get_user_profile(callback.from_user.id)
-        await bot.send_message(other_id, f"❌ {display_name(canceller)} отменил вызов/матч.")
-    except Exception:
-        pass
-        
-    await callback.answer()
-
-
-# ================== АДМИН-КОМАНДЫ ==================
-
-@dp.message(Command("admin"))
-async def cmd_admin(message: types.Message):
-    if not is_admin(message.from_user.id):
-        return
-    await message.answer(
-        "👑 <b>Админ-панель</b>\n\n"
-        "Чтобы забанить или удалить игрока, отправьте команду:\n"
-        "<code>/ban 123456789</code>\n"
-        "<code>/unban 123456789</code>\n"
-        "<code>/delete_user 123456789</code>\n\n"
-        "Или просто <b>перешлите сообщение</b> от нарушителя боту с подписью <code>/ban</code> в ответ.",
-        parse_mode="HTML"
-    )
-
-@dp.message(Command("ban"))
-async def cmd_ban(message: types.Message):
-    if not is_admin(message.from_user.id): return
-    target_id = None
-    
-    if message.reply_to_message:
-        target_id = message.reply_to_message.from_user.id
-    elif len(message.text.split()) > 1:
-        try:
-            target_id = int(message.text.split()[1])
-        except ValueError:
-            pass
-            
-    if not target_id:
-        await message.answer("Укажите ID игрока или ответьте на его сообщение.")
-        return
-        
-    success = await admin_ban_user(target_id, True)
-    if success:
-        await message.answer(f"✅ Игрок {target_id} забанен. Он скрыт из топов и не может играть.")
-        try:
-            await bot.send_message(target_id, "🚫 Вы были заблокированы администратором за нарушение правил.")
-        except Exception:
-            pass
-    else:
-        await message.answer("❌ Игрок с таким ID не найден.")
-
-@dp.message(Command("unban"))
-async def cmd_unban(message: types.Message):
-    if not is_admin(message.from_user.id): return
-    target_id = None
-    if message.reply_to_message:
-        target_id = message.reply_to_message.from_user.id
-    elif len(message.text.split()) > 1:
-        try:
-            target_id = int(message.text.split()[1])
-        except ValueError:
-            pass
-            
-    if not target_id:
-        await message.answer("Укажите ID игрока или ответьте на его сообщение.")
-        return
-        
-    success = await admin_ban_user(target_id, False)
-    if success:
-        await message.answer(f"✅ Игрок {target_id} разбанен.")
-    else:
-        await message.answer("❌ Игрок с таким ID не найден.")
-
-@dp.message(Command("delete_user"))
-async def cmd_delete_user(message: types.Message):
-    if not is_admin(message.from_user.id): return
-    target_id = None
-    if message.reply_to_message:
-        target_id = message.reply_to_message.from_user.id
-    elif len(message.text.split()) > 1:
-        try:
-            target_id = int(message.text.split()[1])
-        except ValueError:
-            pass
-            
-    if not target_id:
-        await message.answer("Укажите ID игрока или ответьте на его сообщение.")
-        return
-        
-    success = await admin_delete_user(target_id)
-    if success:
-        await message.answer(f"🗑 Игрок {target_id} полностью удален. Его история матчей сохранена как 'Удаленный игрок'.")
-    else:
-        await message.answer("❌ Игрок с таким ID не найден.")
-
-# ================== Webhook ==================
-
-async def on_startup(bot: Bot):
-    await init_db()
-    logging.info("База данных инициализирована")
-    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
-    logging.info(f"Webhook установлен: {WEBHOOK_URL}")
-
-async def on_shutdown(bot: Bot):
-    logging.info("Закрываем пул соединений с БД...")
-    await close_pool()
-
-async def healthcheck(request: web.Request):
-    return web.Response(text="OK")
-
-def main():
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-
-    app = web.Application()
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-    app.router.add_get("/", healthcheck)
-    app.router.add_get("/healthcheck", healthcheck)
-    setup_application(app, dp, bot=bot)
-    logging.info(f"Запуск web-сервера на 0.0.0.0:{PORT}")
-    web.run_app(app, host="0.0.0.0", port=PORT)
-
-if __name__ == "__main__":
-    main()
+        "🏆 <
