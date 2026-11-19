@@ -1,12 +1,12 @@
 import logging
-from typing import Callable, Dict, Any, Awaitable
 from aiohttp import web
 
-from aiogram import Bot, Dispatcher, types, BaseMiddleware
+from aiogram import Bot, Dispatcher
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 from config import BOT_TOKEN, PORT, WEBHOOK_PATH, WEBHOOK_URL
-from database import init_db, close_pool, get_user_profile
+from database import init_db, close_pool
+from middlewares import BanCheckMiddleware
 from handlers import (
     common_router,
     rating_router,
@@ -19,24 +19,6 @@ logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-
-
-class BanCheckMiddleware(BaseMiddleware):
-    async def __call__(
-        self,
-        handler: Callable[[types.Message, Dict[str, Any]], Awaitable[Any]],
-        event: types.Message,
-        data: Dict[str, Any]
-    ) -> Any:
-        if event.text and event.text.startswith("/start"):
-            return await handler(event, data)
-
-        user = await get_user_profile(event.from_user.id)
-        if user and user['is_banned']:
-            await event.answer("🚫 Вы заблокированы. Доступ к командам закрыт.")
-            return
-
-        return await handler(event, data)
 
 
 dp.message.outer_middleware(BanCheckMiddleware())
