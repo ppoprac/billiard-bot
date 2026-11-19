@@ -53,3 +53,55 @@ async def admin_delete_user(telegram_id: int):
         await conn.execute('DELETE FROM challenges WHERE challenger_id = $1 OR opponent_id = $1', telegram_id)
         await conn.execute('DELETE FROM pending_results WHERE winner_id = $1 OR loser_id = $1', telegram_id)
         return status != "DELETE 0"
+
+
+# === DISCIPLINES ===
+
+async def get_all_disciplines():
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch('SELECT id, slug, name, sort_order FROM disciplines ORDER BY sort_order, id')
+
+
+async def get_discipline_by_id(discipline_id: int):
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchrow('SELECT id, slug, name, sort_order FROM disciplines WHERE id = $1', discipline_id)
+
+
+async def get_user_rating(telegram_id: int, discipline_id: int):
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            'SELECT user_id, discipline_id, elo, games_played, wins '
+            'FROM user_ratings WHERE user_id = $1 AND discipline_id = $2',
+            telegram_id, discipline_id
+        )
+
+
+async def create_user_rating(telegram_id: int, discipline_id: int, elo: int = 1000):
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            'INSERT INTO user_ratings (user_id, discipline_id, elo) VALUES ($1, $2, $3) '
+            'ON CONFLICT (user_id, discipline_id) DO NOTHING',
+            telegram_id, discipline_id, elo
+        )
+
+
+async def set_user_current_discipline(telegram_id: int, discipline_id: int):
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            'UPDATE users SET current_discipline_id = $1 WHERE telegram_id = $2',
+            discipline_id, telegram_id
+        )
+
+
+async def ensure_user_rating(telegram_id: int, discipline_id: int):
+    """Возвращает запись рейтинга, создавая её при отсутствии."""
+    rating = await get_user_rating(telegram_id, discipline_id)
+    if rating is None:
+        await create_user_rating(telegram_id, discipline_id)
+        rating = await get_user_rating(telegram_id, discipline_id)
+    return rating
