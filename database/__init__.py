@@ -7,6 +7,12 @@ from database.users import (
     get_all_users,
     admin_ban_user,
     admin_delete_user,
+    get_all_disciplines,
+    get_discipline_by_id,
+    get_user_rating,
+    create_user_rating,
+    set_user_current_discipline,
+    ensure_user_rating,
 )
 
 from database.matches import (
@@ -95,7 +101,6 @@ async def init_db():
 
         # ===== Этап 2: дисциплины =====
 
-        # Задача 2.1 — таблица disciplines
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS disciplines (
                 id SERIAL PRIMARY KEY,
@@ -105,7 +110,6 @@ async def init_db():
             )
         ''')
 
-        # Заполнение 12 дисциплин (идемпотентно)
         for idx, (slug, name) in enumerate(DISCIPLINES_SEED, start=1):
             await conn.execute(
                 '''
@@ -118,7 +122,6 @@ async def init_db():
                 slug, name, idx
             )
 
-        # Задача 2.2 — таблица user_ratings
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS user_ratings (
                 user_id BIGINT NOT NULL,
@@ -131,14 +134,12 @@ async def init_db():
             )
         ''')
 
-        # Задача 2.3 — активная дисциплина у пользователя
         await conn.execute('''
             ALTER TABLE users
             ADD COLUMN IF NOT EXISTS current_discipline_id INTEGER
             REFERENCES disciplines(id) DEFAULT 1
         ''')
 
-        # Задача 2.4 — дисциплина у матчей
         await conn.execute('''
             ALTER TABLE matches
             ADD COLUMN IF NOT EXISTS discipline_id INTEGER
