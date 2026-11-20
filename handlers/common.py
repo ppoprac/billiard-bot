@@ -34,6 +34,27 @@ def community_button() -> InlineKeyboardButton | None:
     return InlineKeyboardButton(text="💬 Группа", url=COMMUNITY_CHAT_URL)
 
 
+COMMANDS_HELP = (
+    "👇 <b>Команды</b>\n\n"
+    "👤 <b>Профиль и рейтинг</b>\n"
+    "/profile — Твоя статистика\n"
+    "/top — Таблица рейтинга\n\n"
+    "🎱 <b>Записать результат матча</b>\n"
+    "/result — Я победил\n"
+    "/match — Я проиграл\n\n"
+    "⚔️ <b>Найти соперника</b>\n"
+    "/challenge — Мои вызовы и новый вызов\n\n"
+    "📜 <b>История</b>\n"
+    "/history — Последние матчи\n"
+    "/h2h — Личные встречи\n\n"
+    "⚙️ <b>Настройки и сервис</b>\n"
+    "/discipline — Сменить дисциплину\n"
+    "/report — Пожаловаться на игрока\n"
+    "/help — Все команды\n"
+    "/start — Перезапустить бота"
+)
+
+
 async def get_active_discipline(user):
     if not user or user['current_discipline_id'] is None:
         return None, None
@@ -54,17 +75,7 @@ async def send_welcome(message: types.Message, user):
         f"🎯 Дисциплина: <b>{disc_name}</b>\n"
         f"📊 Твой рейтинг: <b>{elo}</b> ELO\n"
         f"🎮 Игр: {games} | 🏆 Побед: {wins}\n\n"
-        f"👇 Команды:\n"
-        f"/match — Записать поражение\n"
-        f"/result — Записать победу\n"
-        f"/challenge — Вызовы\n"
-        f"/top — Таблица рейтинга\n"
-        f"/profile — Твоя статистика\n"
-        f"/history — История матчей\n"
-        f"/h2h — Личные встречи\n"
-        f"/discipline — Сменить дисциплину\n"
-        f"/report — Пожаловаться на игрока\n"
-        f"/help — Все команды"
+        f"{COMMANDS_HELP}"
         f"{community_line_html()}"
     )
 
@@ -147,20 +158,7 @@ async def process_pick_discipline(callback: CallbackQuery):
 
 @router.message(Command("help"))
 async def cmd_help(message: types.Message):
-    text = (
-        "📖 <b>Команды</b>\n\n"
-        "/start — Начать работу\n"
-        "/profile — Твой профиль\n"
-        "/top — Таблица рейтинга\n"
-        "/match — Записать поражение\n"
-        "/result — Записать победу\n"
-        "/challenge — Активные вызовы и создание нового\n"
-        "/history — Твои последние 10 матчей\n"
-        "/h2h — Статистика личных встреч\n"
-        "/discipline — Сменить дисциплину\n"
-        "/report — Пожаловаться на нарушителя"
-        f"{community_line_html()}"
-    )
+    text = COMMANDS_HELP + community_line_html()
 
     btn = community_button()
     if btn:
