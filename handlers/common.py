@@ -20,13 +20,6 @@ from keyboards.inline import disciplines_keyboard
 router = Router()
 
 
-def community_line_html() -> str:
-    """Строка про группу для HTML-сообщений. Пустая, если ссылка не задана."""
-    if not COMMUNITY_CHAT_URL:
-        return ""
-    return f"\n\n💬 Поиск соперников и общение — в нашей группе: {COMMUNITY_CHAT_URL}"
-
-
 def community_button() -> InlineKeyboardButton | None:
     """Кнопка «💬 Группа» для клавиатур. None, если ссылка не задана."""
     if not COMMUNITY_CHAT_URL:
@@ -63,6 +56,14 @@ async def get_active_discipline(user):
     return discipline, rating
 
 
+def _with_group_button(rows):
+    """Добавляет кнопку группы последней строкой, если ссылка задана."""
+    btn = community_button()
+    if btn:
+        rows = list(rows) + [[btn]]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
 async def send_welcome(message: types.Message, user):
     discipline, rating = await get_active_discipline(user)
     elo = rating['elo'] if rating else 1000
@@ -76,19 +77,14 @@ async def send_welcome(message: types.Message, user):
         f"📊 Твой рейтинг: <b>{elo}</b> ELO\n"
         f"🎮 Игр: {games} | 🏆 Побед: {wins}\n\n"
         f"{COMMANDS_HELP}"
-        f"{community_line_html()}"
     )
 
-    btn = community_button()
-    if btn:
-        await message.answer(
-            text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn]]),
-            disable_web_page_preview=True,
-        )
-    else:
-        await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=_with_group_button([]),
+        disable_web_page_preview=True,
+    )
 
 
 @router.message(CommandStart())
@@ -136,40 +132,25 @@ async def process_pick_discipline(callback: CallbackQuery):
     rating = await get_user_rating(callback.from_user.id, discipline_id)
     elo = rating['elo'] if rating else 1000
 
-    text = (
+    await callback.message.edit_text(
         f"✅ Дисциплина выбрана: <b>{discipline['name']}</b>\n\n"
         f"📊 Твой рейтинг: <b>{elo}</b> ELO\n\n"
-        f"Можешь начинать! Список команд — /help"
-        f"{community_line_html()}"
+        f"Можешь начинать! Список команд — /help",
+        parse_mode="HTML",
+        reply_markup=_with_group_button([]),
+        disable_web_page_preview=True,
     )
-
-    btn = community_button()
-    if btn:
-        await callback.message.edit_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn]]),
-            disable_web_page_preview=True,
-        )
-    else:
-        await callback.message.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
     await callback.answer()
 
 
 @router.message(Command("help"))
 async def cmd_help(message: types.Message):
-    text = COMMANDS_HELP + community_line_html()
-
-    btn = community_button()
-    if btn:
-        await message.answer(
-            text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn]]),
-            disable_web_page_preview=True,
-        )
-    else:
-        await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    await message.answer(
+        COMMANDS_HELP,
+        parse_mode="HTML",
+        reply_markup=_with_group_button([]),
+        disable_web_page_preview=True,
+    )
 
 
 @router.message(Command("cancel"))
