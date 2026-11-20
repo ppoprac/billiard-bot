@@ -29,3 +29,8 @@ WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 K_FACTOR = 30
 MATCH_COOLDOWN_MINUTES = 30
 CHALLENGE_RANGE = 10
+
+# === Сообщество ===
+# Публичная группа для поиска соперников и общения.
+# Если пусто — строка про группу не показывается в боте.
+COMMUNITY_CHAT_URL = "https://t.me/+CjLSnnUt4y5mZDEy"
