@@ -6,7 +6,6 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardBut
 from database import (
     get_user_profile,
     get_all_users,
-    get_all_disciplines,
     get_discipline_by_id,
     get_total_players,
     get_user_rank,
