@@ -1,6 +1,4 @@
 # handlers/rating.py
-from datetime import datetime, timezone
-
 from aiogram import Router, types, F
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -8,6 +6,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardBut
 from database import (
     get_user_profile,
     get_all_users,
+    get_all_disciplines,
     get_discipline_by_id,
     get_total_players,
     get_user_rank,
@@ -19,17 +18,6 @@ from utils import display_name
 
 
 router = Router()
-
-
-INACTIVE_DAYS = 60  # порог неактивности в днях
-
-
-def _is_inactive(last_played_at) -> bool:
-    if not last_played_at:
-        return True
-    now = datetime.now(timezone.utc)
-    delta = now - last_played_at
-    return delta.days >= INACTIVE_DAYS
 
 
 @router.message(Command("top"))
@@ -70,7 +58,6 @@ async def cmd_top(message: types.Message):
 
     text = f"🏆 <b>Рейтинг — {discipline['name'] if discipline else '—'}</b>\n\n"
     prev_rank = 0
-    has_inactive = False
     for rank in display_ranks:
         if rank > prev_rank + 1:
             text += "   ⋮\n"
@@ -78,7 +65,7 @@ async def cmd_top(message: types.Message):
 
         if rank > len(players):
             continue
-        _, tid, uname, fname, elo, last_played = players[rank - 1]
+        _, tid, uname, fname, elo = players[rank - 1]
 
         medal = "🥇" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"{rank}."
         name = fname or uname or "Аноним"
@@ -89,16 +76,9 @@ async def cmd_top(message: types.Message):
         elif rank < user_rank and user_rank - rank <= 10:
             marker = " ⬆️"
 
-        inactive_tag = ""
-        if _is_inactive(last_played):
-            inactive_tag = " 💤"
-            has_inactive = True
-
-        text += f"{medal} {name} — <b>{elo}</b> ELO{marker}{inactive_tag}\n"
+        text += f"{medal} {name} — <b>{elo}</b> ELO{marker}\n"
 
     text += f"\n<i>Всего игроков: {total}</i>\n⬆️ — можешь вызвать через /challenge"
-    if has_inactive:
-        text += f"\n💤 — не играл(а) в этой дисциплине более {INACTIVE_DAYS} дней"
     await message.answer(text, parse_mode="HTML")
 
 
