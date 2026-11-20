@@ -1,257 +1,199 @@
-# handlers/matches.py
-from aiogram import Router, types, F, Bot
-from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+# database/matches.py
+import math
 
-from database import (
-    get_user_profile,
-    get_all_users,
-    get_discipline_by_id,
-    get_user_rating,
-    record_match,
-    create_pending_result,
-    get_pending_result,
-    delete_pending_result,
-)
-from utils import display_name
+from config import K_FACTOR, MATCH_COOLDOWN_MINUTES, CHALLENGE_RANGE
+from database.pool import get_pool
 
 
-router = Router()
+ELO_FLOOR = 100  # нижняя граница рейтинга: ниже не опускаемся
 
 
-# ================== /match (проигравший инициирует) ==================
-
-@router.message(Command("match"))
-async def cmd_match(message: types.Message):
-    user = await get_user_profile(message.from_user.id)
-    if not user:
-        await message.answer("Сначала напиши /start")
-        return
-    if user['current_discipline_id'] is None:
-        await message.answer("Сначала выбери дисциплину через /discipline")
-        return
-
-    players = await get_all_users(30)
-    players = [p for p in players if p['telegram_id'] != message.from_user.id]
-    if not players:
-        await message.answer("Пока не с кем играть")
-        return
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"🎱 {display_name(p)} ({p['elo_rating']} ELO)",
-            callback_data=f"select_opp_{p['telegram_id']}",
-        )] for p in players
-    ])
-    await message.answer(
-        "🎱 <b>Выбери соперника, которому ты проиграл:</b>",
-        reply_markup=keyboard,
-        parse_mode="HTML",
-    )
+def calculate_elo_change(winner_elo: int, loser_elo: int, k_factor: int = K_FACTOR) -> tuple:
+    expected_winner = 1 / (1 + math.pow(10, (loser_elo - winner_elo) / 400))
+    expected_loser = 1 / (1 + math.pow(10, (winner_elo - loser_elo) / 400))
+    winner_change = round(k_factor * (1 - expected_winner))
+    loser_change = round(k_factor * (0 - expected_loser))
+    return winner_change, loser_change
 
 
-@router.callback_query(F.data.startswith("select_opp_"))
-async def process_select_opponent(callback: CallbackQuery):
-    opponent_id = int(callback.data.removeprefix("select_opp_"))
-    loser = await get_user_profile(callback.from_user.id)
-    winner = await get_user_profile(opponent_id)
-    if not loser or not winner:
-        await callback.answer("Игрок не найден", show_alert=True)
-        return
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="✅ Да, я проиграл",
-            callback_data=f"confirm_lose_{opponent_id}",
-        )]
-    ])
-    await callback.message.edit_text(
-        f"Ты ({display_name(loser)}) проиграл {display_name(winner)}?\n"
-        f"Нажми для подтверждения.",
-        reply_markup=keyboard,
-    )
-    await callback.answer()
+async def record_match(winner_id: int, loser_id: int, discipline_id: int):
+    if winner_id == loser_id:
+        return False, "Нельзя записать матч с самим собой"
 
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        w_user = await conn.fetchrow('SELECT is_banned FROM users WHERE telegram_id = $1', winner_id)
+        l_user = await conn.fetchrow('SELECT is_banned FROM users WHERE telegram_id = $1', loser_id)
+        if not w_user or not l_user:
+            return False, "Один из игроков не найден в базе"
+        if w_user['is_banned'] or l_user['is_banned']:
+            return False, "Один из игроков заблокирован"
 
-@router.callback_query(F.data.startswith("confirm_lose_"))
-async def process_confirm_lose(callback: CallbackQuery, bot: Bot):
-    winner_id = int(callback.data.removeprefix("confirm_lose_"))
-    loser_id = callback.from_user.id
-
-    user = await get_user_profile(loser_id)
-    if not user or user['current_discipline_id'] is None:
-        await callback.answer("Сначала выбери дисциплину", show_alert=True)
-        return
-    disc_id = user['current_discipline_id']
-    discipline = await get_discipline_by_id(disc_id)
-
-    success, data = await record_match(winner_id, loser_id, disc_id)
-    if success:
-        new_winner_elo, new_loser_elo, w_change, l_change = data
-        await callback.message.edit_text(
-            f"✅ <b>Результат записан ({discipline['name'] if discipline else '—'})!</b>\n\n"
-            f"📉 Твой рейтинг: <b>{new_loser_elo}</b> ({l_change})\n"
-            f"🏆 Рейтинг соперника: <b>{new_winner_elo}</b> (+{w_change})",
-            parse_mode="HTML",
+        existing = await conn.fetchrow(
+            f'''SELECT id FROM matches 
+                WHERE discipline_id = $5
+                AND ((winner_id = $1 AND loser_id = $2) OR (winner_id = $3 AND loser_id = $4))
+                AND played_at > NOW() - INTERVAL '{MATCH_COOLDOWN_MINUTES} minutes' ''',
+            winner_id, loser_id, loser_id, winner_id, discipline_id
         )
-        try:
-            await bot.send_message(
-                winner_id,
-                f"🎉 Тебе записали победу!\n"
-                f"🎯 Дисциплина: <b>{discipline['name'] if discipline else '—'}</b>\n"
-                f"🏆 Твой новый рейтинг: <b>{new_winner_elo}</b> (+{w_change})",
-                parse_mode="HTML",
+        if existing:
+            return False, f"Матч между вами в этой дисциплине уже записан менее {MATCH_COOLDOWN_MINUTES} минут назад"
+
+        # Гарантируем наличие строк рейтинга
+        for uid in (winner_id, loser_id):
+            await conn.execute(
+                'INSERT INTO user_ratings (user_id, discipline_id, elo) VALUES ($1, $2, 1000) '
+                'ON CONFLICT (user_id, discipline_id) DO NOTHING',
+                uid, discipline_id
             )
-        except Exception:
-            pass
-    else:
-        await callback.message.edit_text(f"❌ {data}")
-    await callback.answer()
 
-
-# ================== /result (победитель инициирует) ==================
-
-@router.message(Command("result"))
-async def cmd_result(message: types.Message):
-    user = await get_user_profile(message.from_user.id)
-    if not user:
-        await message.answer("Сначала напиши /start")
-        return
-    if user['current_discipline_id'] is None:
-        await message.answer("Сначала выбери дисциплину через /discipline")
-        return
-
-    players = await get_all_users(30)
-    players = [p for p in players if p['telegram_id'] != message.from_user.id]
-    if not players:
-        await message.answer("Пока нет других игроков")
-        return
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"🏆 {display_name(p)} ({p['elo_rating']} ELO)",
-            callback_data=f"result_select_{p['telegram_id']}",
-        )] for p in players
-    ])
-    await message.answer(
-        "🏆 <b>Выбери соперника, которого ты победил:</b>",
-        reply_markup=keyboard,
-        parse_mode="HTML",
-    )
-
-
-@router.callback_query(F.data.startswith("result_select_"))
-async def process_result_select(callback: CallbackQuery, bot: Bot):
-    loser_id = int(callback.data.removeprefix("result_select_"))
-    winner_id = callback.from_user.id
-    winner = await get_user_profile(winner_id)
-    loser = await get_user_profile(loser_id)
-    if not winner or not loser:
-        await callback.answer("Игрок не найден", show_alert=True)
-        return
-    if winner['current_discipline_id'] is None:
-        await callback.answer("Сначала выбери дисциплину", show_alert=True)
-        return
-
-    disc_id = winner['current_discipline_id']
-    discipline = await get_discipline_by_id(disc_id)
-
-    success, data = await create_pending_result(winner_id, loser_id, disc_id)
-    if not success:
-        await callback.message.edit_text(f"❌ {data}")
-        await callback.answer()
-        return
-    pending_id = data
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="✅ Подтвердить поражение",
-            callback_data=f"result_confirm_{pending_id}",
-        )],
-        [InlineKeyboardButton(
-            text="❌ Отклонить",
-            callback_data=f"result_decline_{pending_id}",
-        )],
-    ])
-    try:
-        await bot.send_message(
-            loser_id,
-            f"🎱 <b>{display_name(winner)}</b> записал победу над тобой.\n"
-            f"🎯 Дисциплина: <b>{discipline['name'] if discipline else '—'}</b>\n"
-            f"Подтверди, если это правда.",
-            reply_markup=keyboard,
-            parse_mode="HTML",
+        winner_data = await conn.fetchrow(
+            'SELECT elo FROM user_ratings WHERE user_id = $1 AND discipline_id = $2',
+            winner_id, discipline_id
         )
-    except Exception:
-        await callback.message.edit_text(
-            "❌ Не удалось отправить запрос сопернику (возможно, заблокировал бота)."
+        loser_data = await conn.fetchrow(
+            'SELECT elo FROM user_ratings WHERE user_id = $1 AND discipline_id = $2',
+            loser_id, discipline_id
         )
-        await delete_pending_result(pending_id)
-        await callback.answer()
-        return
-    await callback.message.edit_text(
-        f"✅ Запрос отправлен игроку {display_name(loser)}. Ждём подтверждения."
-    )
-    await callback.answer()
 
+        w_change, l_change = calculate_elo_change(winner_data['elo'], loser_data['elo'])
+        new_winner_elo = winner_data['elo'] + w_change
+        new_loser_elo = max(ELO_FLOOR, loser_data['elo'] + l_change)  # нижняя граница
 
-@router.callback_query(F.data.startswith("result_confirm_"))
-async def process_result_confirm(callback: CallbackQuery, bot: Bot):
-    pending_id = int(callback.data.removeprefix("result_confirm_"))
-    pending = await get_pending_result(pending_id)
-    if not pending:
-        await callback.message.edit_text("❌ Запрос устарел или уже обработан.")
-        await callback.answer()
-        return
-    winner_id = pending['winner_id']
-    loser_id = pending['loser_id']
-    disc_id = pending['discipline_id']
-    if callback.from_user.id != loser_id:
-        await callback.answer("Это не твой запрос", show_alert=True)
-        return
+        # Если проигравший уже на дне — фактическое изменение рейтинга может быть меньше
+        actual_l_change = new_loser_elo - loser_data['elo']
 
-    discipline = await get_discipline_by_id(disc_id)
-
-    await delete_pending_result(pending_id)
-    success, data = await record_match(winner_id, loser_id, disc_id)
-    if success:
-        new_winner_elo, new_loser_elo, w_change, l_change = data
-        await callback.message.edit_text(
-            f"✅ <b>Подтверждено ({discipline['name'] if discipline else '—'})!</b>\n\n"
-            f"📉 Твой рейтинг: <b>{new_loser_elo}</b> ({l_change})",
-            parse_mode="HTML",
-        )
-        try:
-            await bot.send_message(
-                winner_id,
-                f"🎉 Соперник подтвердил твою победу!\n"
-                f"🎯 Дисциплина: <b>{discipline['name'] if discipline else '—'}</b>\n"
-                f"🏆 Твой новый рейтинг: <b>{new_winner_elo}</b> (+{w_change})",
-                parse_mode="HTML",
+        async with conn.transaction():
+            await conn.execute(
+                'UPDATE user_ratings SET elo = $1, games_played = games_played + 1, wins = wins + 1 '
+                'WHERE user_id = $2 AND discipline_id = $3',
+                new_winner_elo, winner_id, discipline_id
             )
-        except Exception:
-            pass
-    else:
-        await callback.message.edit_text(f"❌ {data}")
-    await callback.answer()
+            await conn.execute(
+                'UPDATE user_ratings SET elo = $1, games_played = games_played + 1 '
+                'WHERE user_id = $2 AND discipline_id = $3',
+                new_loser_elo, loser_id, discipline_id
+            )
+            await conn.execute(
+                'INSERT INTO matches (winner_id, loser_id, winner_elo_change, loser_elo_change, discipline_id) '
+                'VALUES ($1, $2, $3, $4, $5)',
+                winner_id, loser_id, w_change, actual_l_change, discipline_id
+            )
+
+        return True, (new_winner_elo, new_loser_elo, w_change, actual_l_change)
 
 
-@router.callback_query(F.data.startswith("result_decline_"))
-async def process_result_decline(callback: CallbackQuery, bot: Bot):
-    pending_id = int(callback.data.removeprefix("result_decline_"))
-    pending = await get_pending_result(pending_id)
-    if not pending:
-        await callback.message.edit_text("❌ Запрос устарел.")
-        await callback.answer()
-        return
-    winner_id = pending['winner_id']
-    loser_id = pending['loser_id']
-    if callback.from_user.id != loser_id:
-        await callback.answer("Это не твой запрос", show_alert=True)
-        return
-    await delete_pending_result(pending_id)
-    await callback.message.edit_text("❌ Ты отклонил запрос. Результат не записан.")
-    try:
-        await bot.send_message(
-            winner_id, "❌ Соперник отклонил запрос на победу."
+async def get_match_history(telegram_id: int, discipline_id: int, limit: int = 10):
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch('''
+            SELECT m.id, m.winner_id, m.loser_id, m.winner_elo_change, m.loser_elo_change, m.played_at,
+                   COALESCE(u1.full_name, 'Удаленный игрок') as winner_name, u1.username as winner_username,
+                   COALESCE(u2.full_name, 'Удаленный игрок') as loser_name, u2.username as loser_username
+            FROM matches m
+            LEFT JOIN users u1 ON m.winner_id = u1.telegram_id
+            LEFT JOIN users u2 ON m.loser_id = u2.telegram_id
+            WHERE (m.winner_id = $1 OR m.loser_id = $1) AND m.discipline_id = $2
+            ORDER BY m.played_at DESC LIMIT $3
+        ''', telegram_id, discipline_id, limit)
+
+
+async def get_h2h_stats(user_id1: int, user_id2: int, discipline_id: int):
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        w1 = await conn.fetchval(
+            'SELECT COUNT(*) FROM matches WHERE winner_id = $1 AND loser_id = $2 AND discipline_id = $3',
+            user_id1, user_id2, discipline_id
         )
-    except Exception:
-        pass
-    await callback.answer()
+        w2 = await conn.fetchval(
+            'SELECT COUNT(*) FROM matches WHERE winner_id = $1 AND loser_id = $2 AND discipline_id = $3',
+            user_id2, user_id1, discipline_id
+        )
+        return w1, w2
+
+
+async def get_top_players(discipline_id: int, limit: int = 10):
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch('''
+            SELECT u.telegram_id, u.username, u.full_name, COALESCE(r.elo, 1000) AS elo
+            FROM users u
+            LEFT JOIN user_ratings r
+                ON r.user_id = u.telegram_id AND r.discipline_id = $1
+            WHERE u.is_banned = FALSE
+            ORDER BY COALESCE(r.elo, 1000) DESC, u.telegram_id ASC
+            LIMIT $2
+        ''', discipline_id, limit)
+
+
+async def get_user_rank(telegram_id: int, discipline_id: int):
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            'SELECT elo FROM user_ratings WHERE user_id = $1 AND discipline_id = $2',
+            telegram_id, discipline_id
+        )
+        elo = row['elo'] if row else 1000
+        count = await conn.fetchval('''
+            SELECT COUNT(*) FROM users u
+            LEFT JOIN user_ratings r
+                ON r.user_id = u.telegram_id AND r.discipline_id = $1
+            WHERE u.is_banned = FALSE
+              AND (
+                COALESCE(r.elo, 1000) > $2
+                OR (COALESCE(r.elo, 1000) = $2 AND u.telegram_id < $3)
+              )
+        ''', discipline_id, elo, telegram_id)
+        return count + 1
+
+
+async def get_total_players(discipline_id: int) -> int:
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval('''
+            SELECT COUNT(*) FROM users u
+            LEFT JOIN user_ratings r
+                ON r.user_id = u.telegram_id AND r.discipline_id = $1
+            WHERE u.is_banned = FALSE AND r.user_id IS NOT NULL
+        ''', discipline_id)
+
+
+async def get_players_upto(discipline_id: int, max_rank: int):
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch('''
+            SELECT u.telegram_id, u.username, u.full_name, COALESCE(r.elo, 1000) AS elo
+            FROM users u
+            JOIN user_ratings r
+                ON r.user_id = u.telegram_id AND r.discipline_id = $1
+            WHERE u.is_banned = FALSE
+            ORDER BY r.elo DESC, u.telegram_id ASC
+            LIMIT $2
+        ''', discipline_id, max_rank)
+        return [(i + 1, r['telegram_id'], r['username'], r['full_name'], r['elo']) for i, r in enumerate(rows)]
+
+
+async def get_players_above(telegram_id: int, discipline_id: int, max_above: int = CHALLENGE_RANGE):
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch('''
+            SELECT u.telegram_id, u.username, u.full_name, r.elo
+            FROM users u
+            JOIN user_ratings r
+                ON r.user_id = u.telegram_id AND r.discipline_id = $1
+            WHERE u.is_banned = FALSE
+            ORDER BY r.elo DESC, u.telegram_id ASC
+        ''', discipline_id)
+        user_index = None
+        for i, row in enumerate(rows):
+            if row['telegram_id'] == telegram_id:
+                user_index = i
+                break
+        if user_index is None or user_index == 0:
+            return []
+        start = max(0, user_index - max_above)
+        result = []
+        for i in range(user_index - 1, start - 1, -1):
+            r = rows[i]
+            result.append((i + 1, r['telegram_id'], r['username'], r['full_name'], r['elo']))
+        return result
