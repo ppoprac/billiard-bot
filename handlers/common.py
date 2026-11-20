@@ -2,8 +2,9 @@
 from aiogram import Router, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
+from config import COMMUNITY_CHAT_URL
 from database import (
     get_or_create_user,
     get_user_profile,
@@ -17,6 +18,20 @@ from keyboards.inline import disciplines_keyboard
 
 
 router = Router()
+
+
+def community_line_html() -> str:
+    """Строка про группу для HTML-сообщений. Пустая, если ссылка не задана."""
+    if not COMMUNITY_CHAT_URL:
+        return ""
+    return f"\n\n💬 Поиск соперников и общение — в нашей группе: {COMMUNITY_CHAT_URL}"
+
+
+def community_button() -> InlineKeyboardButton | None:
+    """Кнопка «💬 Группа» для клавиатур. None, если ссылка не задана."""
+    if not COMMUNITY_CHAT_URL:
+        return None
+    return InlineKeyboardButton(text="💬 Группа", url=COMMUNITY_CHAT_URL)
 
 
 async def get_active_discipline(user):
@@ -34,7 +49,7 @@ async def send_welcome(message: types.Message, user):
     wins = rating['wins'] if rating else 0
     disc_name = discipline['name'] if discipline else "—"
 
-    await message.answer(
+    text = (
         f"Привет, {user['full_name']}! 🎱\n\n"
         f"🎯 Дисциплина: <b>{disc_name}</b>\n"
         f"📊 Твой рейтинг: <b>{elo}</b> ELO\n"
@@ -49,9 +64,20 @@ async def send_welcome(message: types.Message, user):
         f"/h2h — Личные встречи\n"
         f"/discipline — Сменить дисциплину\n"
         f"/report — Пожаловаться на игрока\n"
-        f"/help — Все команды",
-        parse_mode="HTML",
+        f"/help — Все команды"
+        f"{community_line_html()}"
     )
+
+    btn = community_button()
+    if btn:
+        await message.answer(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn]]),
+            disable_web_page_preview=True,
+        )
+    else:
+        await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
 
 
 @router.message(CommandStart())
@@ -99,18 +125,29 @@ async def process_pick_discipline(callback: CallbackQuery):
     rating = await get_user_rating(callback.from_user.id, discipline_id)
     elo = rating['elo'] if rating else 1000
 
-    await callback.message.edit_text(
+    text = (
         f"✅ Дисциплина выбрана: <b>{discipline['name']}</b>\n\n"
         f"📊 Твой рейтинг: <b>{elo}</b> ELO\n\n"
-        f"Можешь начинать! Список команд — /help",
-        parse_mode="HTML",
+        f"Можешь начинать! Список команд — /help"
+        f"{community_line_html()}"
     )
+
+    btn = community_button()
+    if btn:
+        await callback.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn]]),
+            disable_web_page_preview=True,
+        )
+    else:
+        await callback.message.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
     await callback.answer()
 
 
 @router.message(Command("help"))
 async def cmd_help(message: types.Message):
-    await message.answer(
+    text = (
         "📖 <b>Команды</b>\n\n"
         "/start — Начать работу\n"
         "/profile — Твой профиль\n"
@@ -121,9 +158,20 @@ async def cmd_help(message: types.Message):
         "/history — Твои последние 10 матчей\n"
         "/h2h — Статистика личных встреч\n"
         "/discipline — Сменить дисциплину\n"
-        "/report — Пожаловаться на нарушителя",
-        parse_mode="HTML",
+        "/report — Пожаловаться на нарушителя"
+        f"{community_line_html()}"
     )
+
+    btn = community_button()
+    if btn:
+        await message.answer(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[btn]]),
+            disable_web_page_preview=True,
+        )
+    else:
+        await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
 
 
 @router.message(Command("cancel"))
