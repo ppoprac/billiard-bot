@@ -39,7 +39,6 @@ async def record_match(winner_id: int, loser_id: int, discipline_id: int):
         if existing:
             return False, f"Матч между вами в этой дисциплине уже записан менее {MATCH_COOLDOWN_MINUTES} минут назад"
 
-        # Гарантируем наличие строк рейтинга
         for uid in (winner_id, loser_id):
             await conn.execute(
                 'INSERT INTO user_ratings (user_id, discipline_id, elo) VALUES ($1, $2, 1000) '
@@ -58,9 +57,8 @@ async def record_match(winner_id: int, loser_id: int, discipline_id: int):
 
         w_change, l_change = calculate_elo_change(winner_data['elo'], loser_data['elo'])
         new_winner_elo = winner_data['elo'] + w_change
-        new_loser_elo = max(ELO_FLOOR, loser_data['elo'] + l_change)  # нижняя граница
+        new_loser_elo = max(ELO_FLOOR, loser_data['elo'] + l_change)
 
-        # Если проигравший уже на дне — фактическое изменение рейтинга может быть меньше
         actual_l_change = new_loser_elo - loser_data['elo']
 
         async with conn.transaction():
@@ -116,7 +114,11 @@ async def get_top_players(discipline_id: int, limit: int = 10):
     pool = get_pool()
     async with pool.acquire() as conn:
         return await conn.fetch('''
-            SELECT u.telegram_id, u.username, u.full_name, COALESCE(r.elo, 1000) AS elo
+            SELECT u.telegram_id, u.username, u.full_name,
+                   COALESCE(r.elo, 1000) AS elo,
+                   (SELECT MAX(m.played_at) FROM matches m
+                    WHERE m.discipline_id = $1
+                      AND (m.winner_id = u.telegram_id OR m.loser_id = u.telegram_id)) AS last_played_at
             FROM users u
             LEFT JOIN user_ratings r
                 ON r.user_id = u.telegram_id AND r.discipline_id = $1
@@ -162,7 +164,11 @@ async def get_players_upto(discipline_id: int, max_rank: int):
     pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch('''
-            SELECT u.telegram_id, u.username, u.full_name, COALESCE(r.elo, 1000) AS elo
+            SELECT u.telegram_id, u.username, u.full_name,
+                   COALESCE(r.elo, 1000) AS elo,
+                   (SELECT MAX(m.played_at) FROM matches m
+                    WHERE m.discipline_id = $1
+                      AND (m.winner_id = u.telegram_id OR m.loser_id = u.telegram_id)) AS last_played_at
             FROM users u
             JOIN user_ratings r
                 ON r.user_id = u.telegram_id AND r.discipline_id = $1
@@ -170,7 +176,10 @@ async def get_players_upto(discipline_id: int, max_rank: int):
             ORDER BY r.elo DESC, u.telegram_id ASC
             LIMIT $2
         ''', discipline_id, max_rank)
-        return [(i + 1, r['telegram_id'], r['username'], r['full_name'], r['elo']) for i, r in enumerate(rows)]
+        return [
+            (i + 1, r['telegram_id'], r['username'], r['full_name'], r['elo'], r['last_played_at'])
+            for i, r in enumerate(rows)
+        ]
 
 
 async def get_players_above(telegram_id: int, discipline_id: int, max_above: int = CHALLENGE_RANGE):
