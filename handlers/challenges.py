@@ -19,6 +19,26 @@ from utils import display_name
 router = Router()
 
 
+def contact_line(user) -> str:
+    """Строка для связи с игроком: @username, либо tg://user?id=..., либо имя."""
+    if not user:
+        return "—"
+    if user['username'] and user['username'] != "Не указан":
+        return f"@{user['username']}"
+    name = user['full_name'] or "Аноним"
+    return f'<a href="tg://user?id={user["telegram_id"]}">{name}</a>'
+
+
+def contact_button(user) -> InlineKeyboardButton | None:
+    """Кнопка «💬 Написать» (открывает чат с пользователем по tg://user?id=)."""
+    if not user:
+        return None
+    return InlineKeyboardButton(
+        text="💬 Написать",
+        url=f"tg://user?id={user['telegram_id']}",
+    )
+
+
 def challenge_actions_keyboard(challenge, user_id: int) -> InlineKeyboardMarkup:
     buttons = []
     if challenge['status'] == 'pending' and challenge['opponent_id'] == user_id:
@@ -73,19 +93,38 @@ async def cmd_challenge(message: types.Message):
         if c['challenger_id'] == message.from_user.id:
             opponent_name = c['opponent_name'] or c['opponent_username'] or "Аноним"
             header = f"📤 Ты вызвал: <b>{opponent_name}</b>"
+            contact_user = await get_user_profile(c['opponent_id'])
         else:
             challenger_name = c['challenger_name'] or c['challenger_username'] or "Аноним"
             header = f"📥 Тебя вызвал: <b>{challenger_name}</b>"
+            contact_user = await get_user_profile(c['challenger_id'])
 
         status_text = "ожидает ответа" if c['status'] == 'pending' else "принят, ждём результат"
         disc_name = c['discipline_name'] or "—"
 
+        # Кнопки: действия по вызову + «💬 Написать»
+        rows = []
+        if c['status'] == 'pending' and c['opponent_id'] == message.from_user.id:
+            rows.append([
+                InlineKeyboardButton(text="✅ Принять", callback_data=f"challenge_accept_{c['id']}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"challenge_decline_{c['id']}"),
+            ])
+        if c['status'] in ('pending', 'accepted'):
+            rows.append([
+                InlineKeyboardButton(text="🚫 Отменить", callback_data=f"challenge_cancel_{c['id']}"),
+            ])
+        write_btn = contact_button(contact_user)
+        if write_btn:
+            rows.append([write_btn])
+
         await message.answer(
             f"{header}\n"
             f"🎯 Дисциплина: <b>{disc_name}</b>\n"
-            f"📌 Статус: {status_text}",
-            reply_markup=challenge_actions_keyboard(c, message.from_user.id),
+            f"📌 Статус: {status_text}\n"
+            f"👤 Связаться: {contact_line(contact_user)}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             parse_mode="HTML",
+            disable_web_page_preview=True,
         )
 
 
@@ -147,10 +186,12 @@ async def process_challenge_select(callback: CallbackQuery, bot: Bot):
     keyboard_opponent = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Принять", callback_data=f"challenge_accept_{challenge_id}")],
         [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"challenge_decline_{challenge_id}")],
+        [InlineKeyboardButton(text="💬 Написать", url=f"tg://user?id={challenger_id}")],
     ])
 
     keyboard_cancel = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отменить вызов", callback_data=f"challenge_cancel_{challenge_id}")]
+        [InlineKeyboardButton(text="❌ Отменить вызов", callback_data=f"challenge_cancel_{challenge_id}")],
+        [InlineKeyboardButton(text="💬 Написать", url=f"tg://user?id={opponent_id}")],
     ])
 
     try:
@@ -158,9 +199,11 @@ async def process_challenge_select(callback: CallbackQuery, bot: Bot):
             opponent_id,
             f"⚔️ <b>{display_name(challenger)}</b> вызывает тебя на матч!\n"
             f"🎯 Дисциплина: <b>{discipline['name'] if discipline else '—'}</b>\n"
-            f"Рейтинг вызывающего: <b>{challenger_elo}</b> ELO",
+            f"Рейтинг вызывающего: <b>{challenger_elo}</b> ELO\n"
+            f"👤 Связаться: {contact_line(challenger)}",
             reply_markup=keyboard_opponent,
             parse_mode="HTML",
+            disable_web_page_preview=True,
         )
     except Exception:
         await callback.message.edit_text("❌ Не удалось отправить вызов (возможно, соперник заблокировал бота).")
@@ -169,9 +212,11 @@ async def process_challenge_select(callback: CallbackQuery, bot: Bot):
         return
     await callback.message.edit_text(
         f"✅ Вызов отправлен игроку {display_name(opponent)}.\n"
-        f"🎯 Дисциплина: <b>{discipline['name'] if discipline else '—'}</b>",
+        f"🎯 Дисциплина: <b>{discipline['name'] if discipline else '—'}</b>\n"
+        f"👤 Связаться: {contact_line(opponent)}",
         reply_markup=keyboard_cancel,
         parse_mode="HTML",
+        disable_web_page_preview=True,
     )
     await callback.answer()
 
@@ -192,27 +237,39 @@ async def process_challenge_accept(callback: CallbackQuery, bot: Bot):
     await update_challenge_status(challenge_id, "accepted")
 
     discipline = await get_discipline_by_id(challenge['discipline_id'])
+    challenger = await get_user_profile(challenger_id)
+    opponent = await get_user_profile(opponent_id)
 
     keyboard_cancel = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отменить матч", callback_data=f"challenge_cancel_{challenge_id}")]
+        [InlineKeyboardButton(text="❌ Отменить матч", callback_data=f"challenge_cancel_{challenge_id}")],
+        [InlineKeyboardButton(text="💬 Написать", url=f"tg://user?id={challenger_id}")],
     ])
 
     await callback.message.edit_text(
         "✅ <b>Вызов принят!</b>\n\n"
-        f"🎯 Дисциплина: <b>{discipline['name'] if discipline else '—'}</b>\n\n"
-        "Сыграйте матч, затем введите результат:\n• Победитель → /result\n• Проигравший → /match",
+        f"🎯 Дисциплина: <b>{discipline['name'] if discipline else '—'}</b>\n"
+        f"👤 Связаться с соперником: {contact_line(challenger)}\n\n"
+        "Договоритесь о времени и месте. После игры введите результат:\n"
+        "• Победитель → /result\n• Проигравший → /match",
         reply_markup=keyboard_cancel,
         parse_mode="HTML",
+        disable_web_page_preview=True,
     )
+
     try:
-        opponent = await get_user_profile(opponent_id)
+        keyboard_for_challenger = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отменить матч", callback_data=f"challenge_cancel_{challenge_id}")],
+            [InlineKeyboardButton(text="💬 Написать", url=f"tg://user?id={opponent_id}")],
+        ])
         await bot.send_message(
             challenger_id,
             f"🎉 {display_name(opponent)} принял твой вызов!\n"
             f"🎯 Дисциплина: <b>{discipline['name'] if discipline else '—'}</b>\n"
-            f"После игры введите результат через /result или /match.",
-            reply_markup=keyboard_cancel,
+            f"👤 Связаться с соперником: {contact_line(opponent)}\n\n"
+            "Договоритесь о времени и месте. После игры введите результат через /result или /match.",
+            reply_markup=keyboard_for_challenger,
             parse_mode="HTML",
+            disable_web_page_preview=True,
         )
     except Exception:
         pass
