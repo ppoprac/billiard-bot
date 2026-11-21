@@ -24,6 +24,7 @@ from database.matches import (
     get_total_players,
     get_players_upto,
     get_players_above,
+    get_players_for_match,
     calculate_elo_change,
 )
 
@@ -145,7 +146,6 @@ async def init_db():
             REFERENCES disciplines(id) DEFAULT 1
         ''')
 
-        # Этап 3.5 — дисциплина у вызовов и pending_results
         await conn.execute('''
             ALTER TABLE challenges
             ADD COLUMN IF NOT EXISTS discipline_id INTEGER
