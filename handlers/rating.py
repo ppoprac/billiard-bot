@@ -5,7 +5,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardBut
 
 from database import (
     get_user_profile,
-    get_all_users,
+    get_all_users_paginated,
     get_discipline_by_id,
     get_total_players,
     get_user_rank,
@@ -18,6 +18,10 @@ from utils import display_name
 
 router = Router()
 
+H2H_PAGE_SIZE = 10
+
+
+# ================== /top ==================
 
 @router.message(Command("top"))
 async def cmd_top(message: types.Message):
@@ -81,6 +85,8 @@ async def cmd_top(message: types.Message):
     await message.answer(text, parse_mode="HTML")
 
 
+# ================== /history ==================
+
 @router.message(Command("history"))
 async def cmd_history(message: types.Message):
     user = await get_user_profile(message.from_user.id)
@@ -115,6 +121,34 @@ async def cmd_history(message: types.Message):
     await message.answer(text, parse_mode="HTML")
 
 
+# ================== /h2h ==================
+
+def _build_h2h_keyboard(players, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows = []
+    for p in players:
+        rows.append([InlineKeyboardButton(
+            text=f"🆚 {display_name(p)}",
+            callback_data=f"h2h_select_{p['telegram_id']}",
+        )])
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="◀️", callback_data=f"h2h_page_{page - 1}"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="▶️", callback_data=f"h2h_page_{page + 1}"))
+        if nav:
+            rows.append(nav)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _build_h2h_text(page: int, total_pages: int) -> str:
+    return (
+        f"🆚 <b>С кем сравниваем?</b>\n"
+        f"<i>Выбери соперника, чтобы увидеть статистику личных встреч в текущей дисциплине. "
+        f"Стр. {page + 1}/{total_pages}</i>"
+    )
+
+
 @router.message(Command("h2h"))
 async def cmd_h2h(message: types.Message):
     user = await get_user_profile(message.from_user.id)
@@ -125,23 +159,35 @@ async def cmd_h2h(message: types.Message):
         await message.answer("Сначала выбери дисциплину через /discipline")
         return
 
-    players = await get_all_users(30)
-    players = [p for p in players if p['telegram_id'] != message.from_user.id]
+    total, players = await get_all_users_paginated(0, H2H_PAGE_SIZE, exclude_id=message.from_user.id)
     if not players:
         await message.answer("Пока нет других игроков для сравнения.")
         return
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"🆚 {display_name(p)}",
-            callback_data=f"h2h_select_{p['telegram_id']}",
-        )] for p in players
-    ])
+    total_pages = (total + H2H_PAGE_SIZE - 1) // H2H_PAGE_SIZE
     await message.answer(
-        "🆚 <b>С кем сравниваем?</b>\nВыбери соперника, чтобы увидеть статистику личных встреч в текущей дисциплине.",
-        reply_markup=keyboard,
+        _build_h2h_text(0, total_pages),
+        reply_markup=_build_h2h_keyboard(players, 0, total_pages),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data.startswith("h2h_page_"))
+async def process_h2h_page(callback: CallbackQuery):
+    page = int(callback.data.removeprefix("h2h_page_"))
+    total, players = await get_all_users_paginated(
+        page * H2H_PAGE_SIZE, H2H_PAGE_SIZE, exclude_id=callback.from_user.id
+    )
+    if not players:
+        await callback.answer("Страница пуста", show_alert=True)
+        return
+    total_pages = (total + H2H_PAGE_SIZE - 1) // H2H_PAGE_SIZE
+    await callback.message.edit_text(
+        _build_h2h_text(page, total_pages),
+        reply_markup=_build_h2h_keyboard(players, page, total_pages),
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("h2h_select_"))
