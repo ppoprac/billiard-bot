@@ -17,7 +17,54 @@ from utils import display_name
 
 router = Router()
 
-MATCH_RANGE = 15  # ±15 позиций по рейтингу дисциплины
+MATCH_RANGE = 15      # ±15 позиций по рейтингу дисциплины (можно 30, 50 или None — вся дисциплина)
+MATCH_PAGE_SIZE = 10  # сколько игроков на одной странице списка
+
+
+# ================== Вспомогательные функции ==================
+
+def _paginate(all_players, page: int):
+    """Возвращает (players_on_page, page, total_pages). Клампит page в допустимый диапазон."""
+    total = len(all_players)
+    total_pages = max(1, (total + MATCH_PAGE_SIZE - 1) // MATCH_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * MATCH_PAGE_SIZE
+    end = start + MATCH_PAGE_SIZE
+    return all_players[start:end], page, total_pages
+
+
+def _match_keyboard(players, page: int, total_pages: int, action_prefix: str, page_prefix: str, emoji: str):
+    rows = []
+    for rank, tid, uname, fname, elo in players:
+        rows.append([InlineKeyboardButton(
+            text=f"{emoji} #{rank} {fname or uname or 'Аноним'} ({elo} ELO)",
+            callback_data=f"{action_prefix}_{tid}",
+        )])
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(
+                text="◀️", callback_data=f"{page_prefix}_{page - 1}"
+            ))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(
+                text="▶️", callback_data=f"{page_prefix}_{page + 1}"
+            ))
+        if nav:
+            rows.append(nav)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _match_text(discipline, page: int, total_pages: int, title: str) -> str:
+    disc_name = discipline['name'] if discipline else '—'
+    if MATCH_RANGE is None:
+        range_text = "вся дисциплина"
+    else:
+        range_text = f"радиус ±{MATCH_RANGE} позиций"
+    return (
+        f"{title}\n"
+        f"<i>Дисциплина: {disc_name}. {range_text}. Стр. {page + 1}/{total_pages}</i>"
+    )
 
 
 # ================== /match (проигравший инициирует) ==================
@@ -34,27 +81,52 @@ async def cmd_match(message: types.Message):
 
     disc_id = user['current_discipline_id']
     discipline = await get_discipline_by_id(disc_id)
-    players = await get_players_for_match(disc_id, message.from_user.id, offset=MATCH_RANGE)
-    if not players:
+    all_players = await get_players_for_match(disc_id, message.from_user.id, offset=MATCH_RANGE)
+    if not all_players:
         await message.answer(
             "Некого выбрать: в этой дисциплине пока нет других игроков "
             f"в радиусе ±{MATCH_RANGE} позиций от тебя."
         )
         return
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"🎱 {fname or uname or 'Аноним'} ({elo} ELO)",
-            callback_data=f"select_opp_{tid}",
-        )] for rank, tid, uname, fname, elo in players
-    ])
+    players, page, total_pages = _paginate(all_players, 0)
     await message.answer(
-        f"🎱 <b>Выбери соперника, которому ты проиграл</b>\n"
-        f"<i>Дисциплина: {discipline['name'] if discipline else '—'}. "
-        f"Показаны игроки в радиусе ±{MATCH_RANGE} позиций.</i>",
-        reply_markup=keyboard,
+        _match_text(discipline, page, total_pages,
+                    "🎱 <b>Выбери соперника, которому ты проиграл</b>"),
+        reply_markup=_match_keyboard(
+            players, page, total_pages,
+            action_prefix="select_opp", page_prefix="match_page", emoji="🎱",
+        ),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data.startswith("match_page_"))
+async def process_match_page(callback: CallbackQuery):
+    page = int(callback.data.removeprefix("match_page_"))
+    user = await get_user_profile(callback.from_user.id)
+    if not user or user['current_discipline_id'] is None:
+        await callback.answer("Сначала выбери дисциплину", show_alert=True)
+        return
+
+    disc_id = user['current_discipline_id']
+    discipline = await get_discipline_by_id(disc_id)
+    all_players = await get_players_for_match(disc_id, callback.from_user.id, offset=MATCH_RANGE)
+    if not all_players:
+        await callback.answer("Список пуст", show_alert=True)
+        return
+
+    players, page, total_pages = _paginate(all_players, page)
+    await callback.message.edit_text(
+        _match_text(discipline, page, total_pages,
+                    "🎱 <b>Выбери соперника, которому ты проиграл</b>"),
+        reply_markup=_match_keyboard(
+            players, page, total_pages,
+            action_prefix="select_opp", page_prefix="match_page", emoji="🎱",
+        ),
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("select_opp_"))
@@ -129,27 +201,52 @@ async def cmd_result(message: types.Message):
 
     disc_id = user['current_discipline_id']
     discipline = await get_discipline_by_id(disc_id)
-    players = await get_players_for_match(disc_id, message.from_user.id, offset=MATCH_RANGE)
-    if not players:
+    all_players = await get_players_for_match(disc_id, message.from_user.id, offset=MATCH_RANGE)
+    if not all_players:
         await message.answer(
             "Некого выбрать: в этой дисциплине пока нет других игроков "
             f"в радиусе ±{MATCH_RANGE} позиций от тебя."
         )
         return
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"🏆 {fname or uname or 'Аноним'} ({elo} ELO)",
-            callback_data=f"result_select_{tid}",
-        )] for rank, tid, uname, fname, elo in players
-    ])
+    players, page, total_pages = _paginate(all_players, 0)
     await message.answer(
-        f"🏆 <b>Выбери соперника, которого ты победил</b>\n"
-        f"<i>Дисциплина: {discipline['name'] if discipline else '—'}. "
-        f"Показаны игроки в радиусе ±{MATCH_RANGE} позиций.</i>",
-        reply_markup=keyboard,
+        _match_text(discipline, page, total_pages,
+                    "🏆 <b>Выбери соперника, которого ты победил</b>"),
+        reply_markup=_match_keyboard(
+            players, page, total_pages,
+            action_prefix="result_select", page_prefix="result_page", emoji="🏆",
+        ),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data.startswith("result_page_"))
+async def process_result_page(callback: CallbackQuery):
+    page = int(callback.data.removeprefix("result_page_"))
+    user = await get_user_profile(callback.from_user.id)
+    if not user or user['current_discipline_id'] is None:
+        await callback.answer("Сначала выбери дисциплину", show_alert=True)
+        return
+
+    disc_id = user['current_discipline_id']
+    discipline = await get_discipline_by_id(disc_id)
+    all_players = await get_players_for_match(disc_id, callback.from_user.id, offset=MATCH_RANGE)
+    if not all_players:
+        await callback.answer("Список пуст", show_alert=True)
+        return
+
+    players, page, total_pages = _paginate(all_players, page)
+    await callback.message.edit_text(
+        _match_text(discipline, page, total_pages,
+                    "🏆 <b>Выбери соперника, которого ты победил</b>"),
+        reply_markup=_match_keyboard(
+            players, page, total_pages,
+            action_prefix="result_select", page_prefix="result_page", emoji="🏆",
+        ),
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("result_select_"))
