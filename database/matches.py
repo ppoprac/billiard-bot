@@ -5,6 +5,9 @@ from config import K_FACTOR, MATCH_COOLDOWN_MINUTES, CHALLENGE_RANGE
 from database.pool import get_pool
 
 
+ELO_FLOOR = 100  # нижняя граница рейтинга: ниже не опускаемся
+
+
 def calculate_elo_change(winner_elo: int, loser_elo: int, k_factor: int = K_FACTOR) -> tuple:
     expected_winner = 1 / (1 + math.pow(10, (loser_elo - winner_elo) / 400))
     expected_loser = 1 / (1 + math.pow(10, (winner_elo - loser_elo) / 400))
@@ -36,7 +39,6 @@ async def record_match(winner_id: int, loser_id: int, discipline_id: int):
         if existing:
             return False, f"Матч между вами в этой дисциплине уже записан менее {MATCH_COOLDOWN_MINUTES} минут назад"
 
-        # Гарантируем наличие строк рейтинга
         for uid in (winner_id, loser_id):
             await conn.execute(
                 'INSERT INTO user_ratings (user_id, discipline_id, elo) VALUES ($1, $2, 1000) '
@@ -55,7 +57,9 @@ async def record_match(winner_id: int, loser_id: int, discipline_id: int):
 
         w_change, l_change = calculate_elo_change(winner_data['elo'], loser_data['elo'])
         new_winner_elo = winner_data['elo'] + w_change
-        new_loser_elo = loser_data['elo'] + l_change
+        new_loser_elo = max(ELO_FLOOR, loser_data['elo'] + l_change)
+
+        actual_l_change = new_loser_elo - loser_data['elo']
 
         async with conn.transaction():
             await conn.execute(
@@ -71,10 +75,10 @@ async def record_match(winner_id: int, loser_id: int, discipline_id: int):
             await conn.execute(
                 'INSERT INTO matches (winner_id, loser_id, winner_elo_change, loser_elo_change, discipline_id) '
                 'VALUES ($1, $2, $3, $4, $5)',
-                winner_id, loser_id, w_change, l_change, discipline_id
+                winner_id, loser_id, w_change, actual_l_change, discipline_id
             )
 
-        return True, (new_winner_elo, new_loser_elo, w_change, l_change)
+        return True, (new_winner_elo, new_loser_elo, w_change, actual_l_change)
 
 
 async def get_match_history(telegram_id: int, discipline_id: int, limit: int = 10):
@@ -188,6 +192,58 @@ async def get_players_above(telegram_id: int, discipline_id: int, max_above: int
         start = max(0, user_index - max_above)
         result = []
         for i in range(user_index - 1, start - 1, -1):
+            r = rows[i]
+            result.append((i + 1, r['telegram_id'], r['username'], r['full_name'], r['elo']))
+        return result
+
+
+async def get_players_for_match(discipline_id: int, user_id: int, offset: int | None = 15):
+    """Список игроков в дисциплине для записи матча (/match, /result).
+
+    offset=None — все игроки в дисциплине.
+    offset=N    — только ±N позиций от user_id по рейтингу дисциплины.
+    Если у user_id нет рейтинга в этой дисциплине — возвращаются первые ~30 игроков.
+
+    Возвращает список кортежей: (rank, telegram_id, username, full_name, elo).
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch('''
+            SELECT u.telegram_id, u.username, u.full_name, r.elo
+            FROM users u
+            JOIN user_ratings r
+                ON r.user_id = u.telegram_id AND r.discipline_id = $1
+            WHERE u.is_banned = FALSE
+            ORDER BY r.elo DESC, u.telegram_id ASC
+        ''', discipline_id)
+
+        if not rows:
+            return []
+
+        user_index = None
+        for i, row in enumerate(rows):
+            if row['telegram_id'] == user_id:
+                user_index = i
+                break
+
+        # У пользователя нет рейтинга в этой дисциплине — показываем верх списка
+        if user_index is None:
+            limit = 30 if offset is None else max(offset * 2, 10)
+            return [
+                (i + 1, r['telegram_id'], r['username'], r['full_name'], r['elo'])
+                for i, r in enumerate(rows[:limit])
+            ]
+
+        if offset is None:
+            start, end = 0, len(rows)
+        else:
+            start = max(0, user_index - offset)
+            end = min(len(rows), user_index + offset + 1)
+
+        result = []
+        for i in range(start, end):
+            if i == user_index:
+                continue
             r = rows[i]
             result.append((i + 1, r['telegram_id'], r['username'], r['full_name'], r['elo']))
         return result
