@@ -9,7 +9,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardBut
 from config import ADMIN_ID
 from database import (
     get_user_profile,
-    get_all_users,
+    get_all_users_paginated,
     admin_ban_user,
     admin_delete_user,
 )
@@ -18,6 +18,33 @@ from utils import display_name, is_admin
 
 
 router = Router()
+
+REPORT_PAGE_SIZE = 10
+
+
+def _build_report_keyboard(players, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows = []
+    for p in players:
+        rows.append([InlineKeyboardButton(
+            text=f"⚠️ {display_name(p)}",
+            callback_data=f"report_target_{p['telegram_id']}",
+        )])
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="◀️", callback_data=f"report_page_{page - 1}"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="▶️", callback_data=f"report_page_{page + 1}"))
+        if nav:
+            rows.append(nav)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _build_report_text(page: int, total_pages: int) -> str:
+    return (
+        f"🚨 <b>На кого жалуешься?</b>\n"
+        f"<i>Выбери игрока из списка ниже. Стр. {page + 1}/{total_pages}</i>"
+    )
 
 
 # ================== /report ==================
@@ -28,23 +55,35 @@ async def cmd_report(message: types.Message, state: FSMContext):
         await message.answer("Сначала напиши /start")
         return
 
-    players = await get_all_users(30)
-    players = [p for p in players if p['telegram_id'] != message.from_user.id]
+    total, players = await get_all_users_paginated(0, REPORT_PAGE_SIZE, exclude_id=message.from_user.id)
     if not players:
         await message.answer("Некого жаловать, в базе нет других игроков.")
         return
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"⚠️ {display_name(p)}",
-            callback_data=f"report_target_{p['telegram_id']}",
-        )] for p in players
-    ])
+    total_pages = (total + REPORT_PAGE_SIZE - 1) // REPORT_PAGE_SIZE
     await message.answer(
-        "🚨 <b>На кого жалуешься?</b>\nВыбери игрока из списка ниже.",
-        reply_markup=keyboard,
+        _build_report_text(0, total_pages),
+        reply_markup=_build_report_keyboard(players, 0, total_pages),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data.startswith("report_page_"))
+async def process_report_page(callback: CallbackQuery):
+    page = int(callback.data.removeprefix("report_page_"))
+    total, players = await get_all_users_paginated(
+        page * REPORT_PAGE_SIZE, REPORT_PAGE_SIZE, exclude_id=callback.from_user.id
+    )
+    if not players:
+        await callback.answer("Страница пуста", show_alert=True)
+        return
+    total_pages = (total + REPORT_PAGE_SIZE - 1) // REPORT_PAGE_SIZE
+    await callback.message.edit_text(
+        _build_report_text(page, total_pages),
+        reply_markup=_build_report_keyboard(players, page, total_pages),
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("report_target_"))
