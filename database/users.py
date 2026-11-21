@@ -39,6 +39,36 @@ async def get_all_users(limit: int = 30):
         )
 
 
+async def get_all_users_paginated(offset: int = 0, limit: int = 10, exclude_id: int | None = None):
+    """Список пользователей с пагинацией.
+
+    Возвращает (total, rows), где total — общее число игроков
+    (с учётом exclude_id), rows — игроки текущей страницы.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        if exclude_id is not None:
+            total = await conn.fetchval(
+                'SELECT COUNT(*) FROM users WHERE is_banned = FALSE AND telegram_id != $1',
+                exclude_id
+            )
+            rows = await conn.fetch(
+                'SELECT telegram_id, username, full_name, elo_rating FROM users '
+                'WHERE is_banned = FALSE AND telegram_id != $1 '
+                'ORDER BY elo_rating DESC, telegram_id ASC LIMIT $2 OFFSET $3',
+                exclude_id, limit, offset
+            )
+        else:
+            total = await conn.fetchval('SELECT COUNT(*) FROM users WHERE is_banned = FALSE')
+            rows = await conn.fetch(
+                'SELECT telegram_id, username, full_name, elo_rating FROM users '
+                'WHERE is_banned = FALSE '
+                'ORDER BY elo_rating DESC, telegram_id ASC LIMIT $2 OFFSET $3',
+                limit, offset
+            )
+        return total, rows
+
+
 async def admin_ban_user(telegram_id: int, ban: bool = True):
     pool = get_pool()
     async with pool.acquire() as conn:
