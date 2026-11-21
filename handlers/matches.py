@@ -5,9 +5,8 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardBut
 
 from database import (
     get_user_profile,
-    get_all_users,
     get_discipline_by_id,
-    get_user_rating,
+    get_players_for_match,
     record_match,
     create_pending_result,
     get_pending_result,
@@ -17,6 +16,8 @@ from utils import display_name
 
 
 router = Router()
+
+MATCH_RANGE = 15  # ±15 позиций по рейтингу дисциплины
 
 
 # ================== /match (проигравший инициирует) ==================
@@ -31,20 +32,26 @@ async def cmd_match(message: types.Message):
         await message.answer("Сначала выбери дисциплину через /discipline")
         return
 
-    players = await get_all_users(30)
-    players = [p for p in players if p['telegram_id'] != message.from_user.id]
+    disc_id = user['current_discipline_id']
+    discipline = await get_discipline_by_id(disc_id)
+    players = await get_players_for_match(disc_id, message.from_user.id, offset=MATCH_RANGE)
     if not players:
-        await message.answer("Пока не с кем играть")
+        await message.answer(
+            "Некого выбрать: в этой дисциплине пока нет других игроков "
+            f"в радиусе ±{MATCH_RANGE} позиций от тебя."
+        )
         return
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text=f"🎱 {display_name(p)} ({p['elo_rating']} ELO)",
-            callback_data=f"select_opp_{p['telegram_id']}",
-        )] for p in players
+            text=f"🎱 {fname or uname or 'Аноним'} ({elo} ELO)",
+            callback_data=f"select_opp_{tid}",
+        )] for rank, tid, uname, fname, elo in players
     ])
     await message.answer(
-        "🎱 <b>Выбери соперника, которому ты проиграл:</b>",
+        f"🎱 <b>Выбери соперника, которому ты проиграл</b>\n"
+        f"<i>Дисциплина: {discipline['name'] if discipline else '—'}. "
+        f"Показаны игроки в радиусе ±{MATCH_RANGE} позиций.</i>",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
@@ -120,19 +127,26 @@ async def cmd_result(message: types.Message):
         await message.answer("Сначала выбери дисциплину через /discipline")
         return
 
-    players = await get_all_users(30)
-    players = [p for p in players if p['telegram_id'] != message.from_user.id]
+    disc_id = user['current_discipline_id']
+    discipline = await get_discipline_by_id(disc_id)
+    players = await get_players_for_match(disc_id, message.from_user.id, offset=MATCH_RANGE)
     if not players:
-        await message.answer("Пока нет других игроков")
+        await message.answer(
+            "Некого выбрать: в этой дисциплине пока нет других игроков "
+            f"в радиусе ±{MATCH_RANGE} позиций от тебя."
+        )
         return
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
-            text=f"🏆 {display_name(p)} ({p['elo_rating']} ELO)",
-            callback_data=f"result_select_{p['telegram_id']}",
-        )] for p in players
+            text=f"🏆 {fname or uname or 'Аноним'} ({elo} ELO)",
+            callback_data=f"result_select_{tid}",
+        )] for rank, tid, uname, fname, elo in players
     ])
     await message.answer(
-        "🏆 <b>Выбери соперника, которого ты победил:</b>",
+        f"🏆 <b>Выбери соперника, которого ты победил</b>\n"
+        f"<i>Дисциплина: {discipline['name'] if discipline else '—'}. "
+        f"Показаны игроки в радиусе ±{MATCH_RANGE} позиций.</i>",
         reply_markup=keyboard,
         parse_mode="HTML",
     )
