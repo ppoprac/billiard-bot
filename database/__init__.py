@@ -5,6 +5,7 @@ from database.users import (
     get_or_create_user,
     get_user_profile,
     get_all_users,
+    get_all_users_paginated,
     admin_ban_user,
     admin_delete_user,
     get_all_disciplines,
